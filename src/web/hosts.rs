@@ -344,8 +344,8 @@ async fn host_view(
         <h1>(host.name.clone())</h1>
         <p class="actions">
             <a href=(href!(rename_host_form, HostId(host_id)))>"Rename"</a>
-            <a href=(href!(clone_host_form, HostId(host_id)))>"Clone…"</a>
-            <a href=(href!(delete_host_confirmation, HostId(host_id)))>"Delete…"</a>
+            <a href=(href!(clone_host_form, HostId(host_id)))>"Clone"</a>
+            <a href=(href!(delete_host_confirmation, HostId(host_id)))>"Delete"</a>
         </p>
         if !warnings.is_empty() {
             <ul class="warnings" role="status">

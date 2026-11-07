@@ -321,7 +321,7 @@ async fn service_view(
         <h1>(service.name.clone())</h1>
         <p class="actions">
             <a href=(href!(rename_service_form, ServiceId(service_id)))>"Rename"</a>
-            <a href=(href!(delete_service_confirmation, ServiceId(service_id)))>"Delete…"</a>
+            <a href=(href!(delete_service_confirmation, ServiceId(service_id)))>"Delete"</a>
         </p>
 
         <h2 id="parent">"Parent Service"</h2>

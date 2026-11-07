@@ -140,11 +140,10 @@ pub(super) async fn host_instances_list(instances: Vec<ServiceInstance>) -> Resu
                         <li>
                             <a href=(href!(instance_detail, InstanceId(instance.id)))>(instance.name.clone())</a>
                             " at " <code>(instance.ip.clone())</code>
-                            " · "
                             <a href=(href!(clone_instance_form, InstanceId(instance.id)))
                                 class="button"
                                 aria-label=(format!("Clone {}", instance.label()))
-                            >"Clone…"</a>
+                            >"Clone"</a>
                         </li>
                     }
                 </ul>
@@ -367,9 +366,9 @@ async fn instance_view(
             // An instance of a missing Service can't be cloned (cli/si's
             // clone inserts nothing then).
             if instance.service_exists {
-                <a href=(href!(clone_instance_form, InstanceId(id)))>"Clone…"</a>
+                <a href=(href!(clone_instance_form, InstanceId(id)))>"Clone"</a>
             }
-            <a href=(href!(delete_instance_confirmation, InstanceId(id)))>"Delete…"</a>
+            <a href=(href!(delete_instance_confirmation, InstanceId(id)))>"Delete"</a>
         </p>
 
         <h2 id="identity">"Instance Name and IP"</h2>

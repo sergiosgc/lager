@@ -303,7 +303,7 @@ async fn group_view(
         <h1>(group.name.clone())</h1>
         <p class="actions">
             <a href=(href!(rename_group_form, GroupId(group_id)))>"Rename"</a>
-            <a href=(href!(delete_group_confirmation, GroupId(group_id)))>"Delete…"</a>
+            <a href=(href!(delete_group_confirmation, GroupId(group_id)))>"Delete"</a>
         </p>
 
         <h2 id="parent">"Parent Group"</h2>
