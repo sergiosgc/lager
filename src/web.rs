@@ -91,27 +91,6 @@ pub(crate) fn inventory(cx: &Cx) -> &Inventory {
     app_context::<Inventory>(cx)
 }
 
-/// The styles pages had before the stylesheet. `/css/index.css` comes after
-/// them, so it overrides them.
-const STYLE: &str = "
-body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 0 auto; padding: 0 1rem; }
-nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; }
-.error { color: #b00020; }
-.warnings { background: #fff4ce; border-left: 4px solid #c88a00; padding: .5rem 1rem .5rem 2rem; }
-.actions { display: flex; gap: 1rem; }
-.danger { color: #fff; background: #b00020; border: 0; padding: .4rem .8rem; }
-.items li { display: flex; gap: .75rem; align-items: center; }
-.items form, form.inline { display: flex; gap: .5rem; align-items: center; margin: .5rem 0; }
-form.inline label { display: inline; margin: 0; }
-label.check { display: block; }
-.hint { color: #555; font-size: .9em; margin: .25rem 0; }
-label { display: block; margin-bottom: .25rem; }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; vertical-align: top; padding: .25rem .5rem .25rem 0; }
-td form { display: flex; gap: .5rem; align-items: flex-start; }
-textarea { font-family: ui-monospace, monospace; width: 100%; min-width: 12rem; }
-";
-
 #[layout("/")]
 async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
     Ok(view! {
@@ -121,7 +100,6 @@ async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
                 <meta charset="utf-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"Lager"</title>
-                <style>(STYLE)</style>
                 <link rel="stylesheet" href="/css/index.css">
             </head>
             <body>
