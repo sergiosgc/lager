@@ -16,6 +16,11 @@ struct Args {
     /// The address to serve the web interface on.
     #[arg(long, default_value = "127.0.0.1:3000")]
     listen: SocketAddr,
+
+    /// The directory holding the stylesheets (css/, served at /css/) and
+    /// images (img/, served at /img/).
+    #[arg(long, default_value = "./webroot")]
+    webroot: PathBuf,
 }
 
 #[tokio::main]
@@ -38,12 +43,18 @@ async fn main() -> ExitCode {
         }
     };
 
+    if !args.webroot.join("css/index.css").is_file() {
+        eprintln!(
+            "lager: warning: {} has no css/index.css; pages will be unstyled",
+            args.webroot.display()
+        );
+    }
     eprintln!(
         "lager: editing {} at http://{}",
         args.database.display(),
         args.listen
     );
-    if let Err(e) = topcoat::serve(listener, lager::web::router(inventory)).await {
+    if let Err(e) = topcoat::serve(listener, lager::web::router(inventory, &args.webroot)).await {
         eprintln!("lager: {e}");
         return ExitCode::FAILURE;
     }

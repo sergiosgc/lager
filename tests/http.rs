@@ -9,10 +9,24 @@ use topcoat::router::{
     Body, Router, StatusCode, header, request::Request, response::Response, to_bytes,
 };
 
+/// The app on a temporary database, with an empty webroot: these tests
+/// don't depend on the stylesheets checked out next to them.
 async fn app() -> (common::TempDb, Router) {
     let db = temp_db();
-    let router = lager::web::router(open(&db).await);
+    let webroot = db.dir.path().join("webroot");
+    let router = lager::web::router(open(&db).await, &webroot);
     (db, router)
+}
+
+/// A temporary webroot holding these files, as (relative path, contents).
+fn webroot_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    for (path, contents) in files {
+        let path = root.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    root
 }
 
 async fn get(router: &Router, uri: &str) -> Response {
@@ -702,4 +716,67 @@ async fn the_variables_page_lists_every_usage_and_entity_pages_link_to_it() {
         host_page.contains(r#"href="/variables#variable-6e747020736572766572""#),
         "{host_page}"
     );
+}
+
+#[tokio::test]
+async fn pages_link_the_stylesheet_and_it_is_served() {
+    let (db, _) = app().await;
+    let root = webroot_with(&[("css/index.css", "body { margin: 0; }")]);
+    let router = lager::web::router(open(&db).await, root.path());
+
+    let page = text(get(&router, "/hosts").await).await;
+    assert!(
+        page.contains(r#"<link rel="stylesheet" href="/css/index.css">"#),
+        "{page}"
+    );
+
+    let css = get(&router, "/css/index.css").await;
+    assert_eq!(css.status(), StatusCode::OK);
+    assert!(
+        css.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css"),
+        "{:?}",
+        css.headers()
+    );
+}
+
+#[tokio::test]
+async fn serves_css_from_webroot_css_and_images_from_webroot_img() {
+    let (db, _) = app().await;
+    let root = webroot_with(&[
+        ("css/themes/dark.css", "body { color: #eee; }"),
+        (
+            "img/logo.svg",
+            r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#,
+        ),
+        ("secret.txt", "not served"),
+    ]);
+    let router = lager::web::router(open(&db).await, root.path());
+
+    let css = get(&router, "/css/themes/dark.css").await;
+    assert_eq!(css.status(), StatusCode::OK);
+    assert_eq!(text(css).await, "body { color: #eee; }");
+    let svg = get(&router, "/img/logo.svg").await;
+    assert_eq!(svg.status(), StatusCode::OK);
+    assert!(
+        svg.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("image/svg+xml")
+    );
+
+    for missing in [
+        "/css/nope.css",
+        "/img/nope.png",
+        "/css/../secret.txt",
+        "/img/..%2Fsecret.txt",
+    ] {
+        assert_eq!(
+            get(&router, missing).await.status(),
+            StatusCode::NOT_FOUND,
+            "{missing}"
+        );
+    }
 }

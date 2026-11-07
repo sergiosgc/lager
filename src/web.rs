@@ -8,7 +8,7 @@ use topcoat::{
     Result,
     context::{Cx, app_context},
     router::{
-        Router, Slot,
+        Router, RouterBuilderDirectoryExt, Slot,
         error::{SeeOther, not_found, see_other},
         href, layout, route,
     },
@@ -21,12 +21,19 @@ mod service_instances;
 mod services;
 mod variables;
 
+use std::path::Path;
+
 use crate::inventory::{self, Inventory};
 
 /// Builds the router serving `inventory`.
-pub fn router(inventory: Inventory) -> Router {
+pub fn router(inventory: Inventory, webroot: &Path) -> Router {
     Router::builder()
         .app_context(inventory)
+        // Read from disk on every request, so stylesheet and image edits
+        // show without rebuilding. Paths with `..` and missing files are
+        // 404s.
+        .serve_dir("/css/{*file}", webroot.join("css"))
+        .serve_dir("/img/{*file}", webroot.join("img"))
         .layout(root_layout)
         .route(home)
         .page(hosts::hosts_list)
@@ -84,6 +91,8 @@ pub(crate) fn inventory(cx: &Cx) -> &Inventory {
     app_context::<Inventory>(cx)
 }
 
+/// The styles pages had before the stylesheet. `/css/index.css` comes after
+/// them, so it overrides them.
 const STYLE: &str = "
 body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 0 auto; padding: 0 1rem; }
 nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; }
@@ -113,6 +122,7 @@ async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>"Lager"</title>
                 <style>(STYLE)</style>
+                <link rel="stylesheet" href="/css/index.css">
             </head>
             <body>
                 <nav>
