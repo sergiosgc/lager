@@ -15,8 +15,12 @@ use topcoat::{
 };
 
 use super::groups::{GroupId, group_detail};
+use super::variables::{
+    FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
+    own_variables_section, removed_variables_section,
+};
 use super::{FieldError, inventory, page_error};
-use crate::inventory::{Group, Host, HostDeletion, OwnVariable};
+use crate::inventory::{EffectiveVariable, Group, Host, HostDeletion, OwnVariable, Owner};
 
 #[page("/hosts")]
 pub(super) async fn hosts_list(cx: &Cx) -> Result<impl View> {
@@ -139,6 +143,7 @@ pub(super) async fn host_detail(cx: &Cx) -> Result<impl View> {
 pub(super) struct HostPage {
     host: Host,
     variables: Vec<OwnVariable>,
+    effective: Vec<EffectiveVariable>,
     warnings: Vec<String>,
     /// The Groups the Host is directly in.
     groups: Vec<Group>,
@@ -149,7 +154,8 @@ pub(super) struct HostPage {
 async fn load_host_page(cx: &Cx, host: Host) -> Result<HostPage> {
     let inventory = inventory(cx);
     Ok(HostPage {
-        variables: inventory.host_variables(host.id).await?,
+        variables: inventory.own_variables(Owner::Host(host.id)).await?,
+        effective: inventory.effective_variables(Owner::Host(host.id)).await?,
         warnings: inventory.host_warnings(host.id).await?,
         groups: inventory.host_groups(host.id).await?,
         all_groups: inventory.groups().await?,
@@ -163,30 +169,6 @@ async fn path_host(cx: &Cx) -> Result<Host> {
     Ok(inventory(cx).host(id).await?.ok_or_not_found()?)
 }
 
-/// Which Variable form a rejected submission came from.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum VariableFormKind {
-    /// The form adding a new Variable.
-    Add,
-    /// The in-place edit form on an existing Variable's row.
-    Edit,
-}
-
-#[derive(Deserialize)]
-pub(super) struct VariableInput {
-    form: VariableFormKind,
-    name: String,
-    value: String,
-}
-
-/// A Variable submission that was rejected, to show again with its error.
-struct FailedVariable {
-    input: VariableInput,
-    field: &'static str,
-    message: String,
-}
-
 #[page(POST "/hosts/{host_id}/variables")]
 pub(super) async fn set_host_variable(
     cx: &Cx,
@@ -194,7 +176,7 @@ pub(super) async fn set_host_variable(
 ) -> Result<impl View> {
     let host = path_host(cx).await?;
     match inventory(cx)
-        .set_host_variable(host.id, &input.name, &input.value)
+        .set_variable(Owner::Host(host.id), &input.name, &input.value)
         .await
     {
         Ok(_) => Err(see_other(host_variables_url(cx, host.id)).into()),
@@ -211,11 +193,6 @@ pub(super) async fn set_host_variable(
     }
 }
 
-#[derive(Deserialize)]
-pub(super) struct RemoveVariable {
-    name: String,
-}
-
 #[page(POST "/hosts/{host_id}/variables/remove")]
 pub(super) async fn remove_host_variable(
     cx: &Cx,
@@ -223,7 +200,7 @@ pub(super) async fn remove_host_variable(
 ) -> Result<impl View> {
     let host = path_host(cx).await?;
     inventory(cx)
-        .remove_host_variable(host.id, &input.name)
+        .remove_variable(Owner::Host(host.id), &input.name)
         .await
         .map_err(page_error)?;
     Err::<(), _>(see_other(host_variables_url(cx, host.id)).into())
@@ -294,14 +271,14 @@ pub(super) async fn set_host_groups(
     Err::<(), _>(see_other(host_url(cx, host.id, "groups")).into())
 }
 
-/// A Host's page: its name and its Own Variables, each editable in place,
-/// plus a form to add one. A rejected submission is shown again in the form
-/// it came from, with its error.
+/// A Host's page: its Groups, Own Variables and Effective Variables. A
+/// rejected Variable submission is shown again with its error.
 #[component]
-async fn host_view(page: HostPage, failed: Option<FailedVariable>) -> Result<impl View> {
+async fn host_view(cx: &Cx, page: HostPage, failed: Option<FailedVariable>) -> Result<impl View> {
     let HostPage {
         host,
         variables,
+        effective,
         warnings,
         groups,
         all_groups,
@@ -312,31 +289,7 @@ async fn host_view(page: HostPage, failed: Option<FailedVariable>) -> Result<imp
         .filter(|g| !groups.iter().any(|m| m.id == g.id))
         .cloned()
         .collect();
-    let (edit_failure, add_failure) = match failed {
-        // An edit whose row is gone (e.g. removed meanwhile) shows in the add
-        // form instead, so its input isn't lost.
-        Some(f)
-            if f.input.form == VariableFormKind::Edit
-                && variables.iter().any(|v| v.name == f.input.name) =>
-        {
-            (Some(f), None)
-        }
-        other => (None, other),
-    };
-    let add_name = add_failure
-        .as_ref()
-        .map_or(String::new(), |f| f.input.name.clone());
-    let add_value = add_failure
-        .as_ref()
-        .map_or(String::new(), |f| f.input.value.clone());
-    let add_error = |field: &str| {
-        add_failure
-            .as_ref()
-            .filter(|f| f.field == field)
-            .map(|f| f.message.clone())
-    };
-    let (add_name_error, add_value_error) = (add_error("name"), add_error("value"));
-    let status_failed = edit_failure.is_some() || add_failure.is_some();
+    let status_failed = failed.is_some();
     Ok(view! {
         if status_failed {
             (StatusCode::UNPROCESSABLE_ENTITY)
@@ -409,88 +362,14 @@ async fn host_view(page: HostPage, failed: Option<FailedVariable>) -> Result<imp
             </details>
         }
 
-        <h2 id="variables">"Own Variables"</h2>
-        if variables.is_empty() {
-            <p>"This Host has no Own Variables."</p>
-        } else {
-            <table>
-                <thead><tr><th>"Name"</th><th>"Value (JSON)"</th><th></th></tr></thead>
-                <tbody>
-                    #[key(variable.name.clone())]
-                    for variable in variables {
-                        let failure = edit_failure
-                            .as_ref()
-                            .filter(|f| f.input.name == variable.name);
-                        let value = failure.map_or(variable.value.clone(), |f| f.input.value.clone());
-                        let error = failure.map(|f| f.message.clone());
-                        let error_id = format!("variable-error-{}", variable.name);
-                        <tr>
-                            <th scope="row">(variable.name.clone())</th>
-                            <td>
-                                <form method="post" action=(href!(set_host_variable, HostId(host_id)))>
-                                    <input type="hidden" name="form" value="edit">
-                                    <input type="hidden" name="name" value=(variable.name.clone())>
-                                    <div>
-                                        <textarea name="value" rows="1"
-                                            aria-label=(format!("Value of {}", variable.name))
-                                            if error.is_some() {
-                                                aria-invalid="true"
-                                                aria-describedby=(error_id.clone())
-                                            }
-                                        >(value)</textarea>
-                                        if let Some(error) = error {
-                                            <p id=(error_id) class="error">(error)</p>
-                                        }
-                                    </div>
-                                    <button type="submit">"Save"</button>
-                                </form>
-                            </td>
-                            <td>
-                                <form method="post" action=(href!(remove_host_variable, HostId(host_id)))>
-                                    <input type="hidden" name="name" value=(variable.name.clone())>
-                                    <button type="submit"
-                                        aria-label=(format!("Remove {}", variable.name))
-                                    >"Remove"</button>
-                                </form>
-                            </td>
-                        </tr>
-                    }
-                </tbody>
-            </table>
-        }
-
-        <h3>"Add a Variable"</h3>
-        <form method="post" action=(href!(set_host_variable, HostId(host_id)))>
-            <input type="hidden" name="form" value="add">
-            <label for="variable-name">"Name"</label>
-            <input id="variable-name" name="name" value=(add_name) required=(true)
-                if add_name_error.is_some() {
-                    aria-invalid="true"
-                    aria-describedby="variable-name-error"
-                }
-            >
-            if let Some(error) = add_name_error {
-                <p id="variable-name-error" class="error">(error)</p>
-            }
-            <label for="variable-value">"Value (JSON)"</label>
-            <textarea id="variable-value" name="value" rows="3"
-                aria-describedby=(if add_value_error.is_some() {
-                    "variable-value-hint variable-value-error"
-                } else {
-                    "variable-value-hint"
-                })
-                if add_value_error.is_some() {
-                    aria-invalid="true"
-                }
-            >(add_value)</textarea>
-            <p id="variable-value-hint" class="hint">
-                "Any JSON value: a quoted string like \"ntp.example.org\", a number, true or false, a list or an object."
-            </p>
-            if let Some(error) = add_value_error {
-                <p id="variable-value-error" class="error">(error)</p>
-            }
-            <p><button type="submit">"Add Variable"</button></p>
-        </form>
+        own_variables_section(
+            set_url: href!(set_host_variable, HostId(host_id)).resolve(cx),
+            remove_url: href!(remove_host_variable, HostId(host_id)).resolve(cx),
+            variables: variables,
+            failed: failed,
+            empty: "This Host has no Own Variables.".to_string(),
+        )
+        effective_variables_section(effective: effective)
     })
 }
 
@@ -597,21 +476,7 @@ async fn delete_host_view(deletion: HostDeletion, refused: bool) -> Result<impl 
             <p><a href=(href!(host_detail, HostId(host_id)))>"Back to " (deletion.host.name)</a></p>
         } else {
             <p>"This removes the Host " <strong>(deletion.host.name.clone())</strong> " and:"</p>
-            if deletion.own_variables.is_empty() {
-                <p>"No Own Variables."</p>
-            } else {
-                <table>
-                    <caption>"Own Variables"</caption>
-                    <thead><tr><th>"Name"</th><th>"Value"</th></tr></thead>
-                    <tbody>
-                        #[key(variable.name.clone())]
-                        for variable in deletion.own_variables {
-                            <tr><th scope="row">(variable.name)</th><td><code>(variable.value)</code></td></tr>
-                        }
-                    </tbody>
-                </table>
-            }
-            <p class="hint">"Variable names stay, for anything else using them."</p>
+            removed_variables_section(variables: deletion.own_variables)
             <h2>"Groups it leaves"</h2>
             if deletion.groups.is_empty() {
                 <p>"None: it isn't directly in any Group."</p>

@@ -34,7 +34,8 @@ pub struct GroupTreeEntry {
     pub group: Group,
 }
 
-/// What deleting a Group does: removes it and its memberships, and clears
+/// What deleting a Group does: removes it, its Own Variables and its
+/// memberships, and clears
 /// the Parent Group of its child Groups (which stay). While `blockers` isn't
 /// empty, the Group can't be deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub struct GroupDeletion {
     pub member_hosts: Vec<Host>,
     /// Groups that lose their Parent Group (and become top-level).
     pub child_groups: Vec<Group>,
+    pub own_variables: Vec<OwnVariable>,
     /// Memberships of Hosts that no longer exist, left behind by `cli/si`;
     /// the delete removes them too.
     pub missing_memberships: usize,
@@ -270,6 +272,7 @@ impl Inventory {
         let mut tx = db.transaction().await?;
         let plan = plan_group_deletion(&mut tx, group_id).await?;
         refuse_if_blocked("group", &plan.group.name, &plan.blockers)?;
+        delete_owner_values(&mut tx, Owner::Group(group_id)).await?;
         models::Membership::filter(models::Membership::fields().group_id().eq(group_id))
             .delete()
             .exec(&mut tx)
@@ -287,7 +290,7 @@ impl Inventory {
     }
 }
 
-async fn all_groups(db: &mut impl toasty::Executor) -> Result<Vec<Group>, Error> {
+pub(super) async fn all_groups(db: &mut impl toasty::Executor) -> Result<Vec<Group>, Error> {
     Ok(models::Group::all()
         .exec(db)
         .await?
@@ -444,26 +447,16 @@ async fn plan_group_deletion(
         .into_iter()
         .filter(|g| g.id != group_id)
         .collect();
-    // TEMPORARY until Group Variables (#11): not modelled yet, so counted
-    // with raw SQL, and they block the delete instead of cascading.
-    let variables = count_rows(
-        &mut *db,
-        r#"SELECT count(*) FROM host_group_variable WHERE "group" = ?1"#,
-        group_id,
-    )
-    .await?;
-    let mut blockers = Vec::new();
-    if variables > 0 {
-        blockers.push(format!(
-            "It has {}, and lager can't remove Group Variables yet.",
-            plural(variables, "Own Variable")
-        ));
-    }
+    let own_variables = own_variables_to_delete(&mut *db, Owner::Group(group_id)).await?;
+    // Nothing blocks a Group delete any more; kept for the shared shape of
+    // deletion plans.
+    let blockers = Vec::new();
     Ok(GroupDeletion {
         group: group.into(),
         missing_memberships: memberships - member_hosts.len(),
         member_hosts,
         child_groups,
+        own_variables,
         blockers,
     })
 }

@@ -62,3 +62,18 @@ pub struct Membership {
     #[column("group")]
     pub group_id: i64,
 }
+
+/// A Group's Own Variable. The schema's foreign key on `group` points at a
+/// table that doesn't exist (ADR 0003).
+#[derive(Debug, toasty::Model)]
+#[table = "host_group_variable"]
+#[key(variable_id, group_id)]
+pub struct GroupVariable {
+    #[column("variable")]
+    pub variable_id: i64,
+
+    #[column("group")]
+    pub group_id: i64,
+
+    pub value: String,
+}

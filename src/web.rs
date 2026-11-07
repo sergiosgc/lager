@@ -17,6 +17,7 @@ use topcoat::{
 
 mod groups;
 mod hosts;
+mod variables;
 
 use crate::inventory::{self, Inventory};
 
@@ -50,6 +51,8 @@ pub fn router(inventory: Inventory) -> Router {
         .page(groups::remove_group_host)
         .page(groups::delete_group_confirmation)
         .page(groups::delete_group)
+        .page(groups::set_group_variable)
+        .page(groups::remove_group_variable)
         .build()
 }
 

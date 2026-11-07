@@ -3,7 +3,7 @@
 mod common;
 
 use common::{open, rows_referring_to, sql, temp_db};
-use lager::inventory::{Error, Inventory, OpenError, OwnVariable, SERVER_INDEX};
+use lager::inventory::{Error, Inventory, OpenError, OwnVariable, Owner, SERVER_INDEX};
 
 #[tokio::test]
 async fn refuses_a_missing_database_file() {
@@ -178,7 +178,7 @@ async fn rejects_a_name_that_normalizes_to_an_existing_host() {
 /// A Host's Own Variables, leaving out the `server_index` every new Host
 /// gets, which the Server Index tests cover.
 async fn variables_besides_server_index(inventory: &Inventory, host_id: i64) -> Vec<OwnVariable> {
-    let mut variables = inventory.host_variables(host_id).await.unwrap();
+    let mut variables = inventory.own_variables(Owner::Host(host_id)).await.unwrap();
     variables.retain(|v| v.name != SERVER_INDEX);
     variables
 }
@@ -197,11 +197,15 @@ async fn sets_host_own_variables_listed_by_name() {
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
 
     inventory
-        .set_host_variable(web1.id, "ntp_server", r#""ntp.example.org""#)
+        .set_variable(Owner::Host(web1.id), "ntp_server", r#""ntp.example.org""#)
         .await
         .unwrap();
     inventory
-        .set_host_variable(web1.id, "dns", r#"["192.0.2.53", "192.0.2.54"]"#)
+        .set_variable(
+            Owner::Host(web1.id),
+            "dns",
+            r#"["192.0.2.53", "192.0.2.54"]"#,
+        )
         .await
         .unwrap();
 
@@ -222,7 +226,7 @@ async fn stores_the_json_text_exactly_as_submitted() {
     let value = "{ \"b\": 1,\n  \"a\": [1.50, true] }";
 
     inventory
-        .set_host_variable(web1.id, "cfg", value)
+        .set_variable(Owner::Host(web1.id), "cfg", value)
         .await
         .unwrap();
 
@@ -238,12 +242,12 @@ async fn overwrites_an_own_variable() {
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
 
     inventory
-        .set_host_variable(web1.id, "port", "8080")
+        .set_variable(Owner::Host(web1.id), "port", "8080")
         .await
         .unwrap();
 
@@ -261,11 +265,11 @@ async fn own_variables_belong_to_their_host() {
     let web2 = inventory.create_host("web2", None).await.unwrap().value;
 
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web2.id, "port", "81")
+        .set_variable(Owner::Host(web2.id), "port", "81")
         .await
         .unwrap();
 
@@ -286,16 +290,16 @@ async fn removing_an_own_variable_leaves_it_on_other_hosts() {
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     let web2 = inventory.create_host("web2", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web2.id, "port", "81")
+        .set_variable(Owner::Host(web2.id), "port", "81")
         .await
         .unwrap();
 
     inventory
-        .remove_host_variable(web1.id, "port")
+        .remove_variable(Owner::Host(web1.id), "port")
         .await
         .unwrap();
 
@@ -316,12 +320,12 @@ async fn removing_the_last_value_keeps_the_variable_name() {
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
 
     inventory
-        .remove_host_variable(web1.id, "port")
+        .remove_variable(Owner::Host(web1.id), "port")
         .await
         .unwrap();
 
@@ -339,19 +343,19 @@ async fn setting_a_variable_reuses_its_name() {
     let web2 = inventory.create_host("web2", None).await.unwrap().value;
 
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web2.id, "port", "81")
+        .set_variable(Owner::Host(web2.id), "port", "81")
         .await
         .unwrap();
     inventory
-        .remove_host_variable(web1.id, "port")
+        .remove_variable(Owner::Host(web1.id), "port")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web1.id, "port", "82")
+        .set_variable(Owner::Host(web1.id), "port", "82")
         .await
         .unwrap();
 
@@ -367,13 +371,13 @@ async fn rejects_a_value_that_is_not_json() {
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
 
     for value in ["", "ntp.example.org", "{\"a\": 1", "[1, 2,]"] {
         let err = inventory
-            .set_host_variable(web1.id, "port", value)
+            .set_variable(Owner::Host(web1.id), "port", value)
             .await
             .unwrap_err();
         assert!(
@@ -395,7 +399,7 @@ async fn rejects_an_empty_variable_name() {
 
     for name in ["", "  "] {
         let err = inventory
-            .set_host_variable(web1.id, name, "1")
+            .set_variable(Owner::Host(web1.id), name, "1")
             .await
             .unwrap_err();
         assert!(
@@ -418,16 +422,16 @@ async fn keeps_variable_names_exactly_as_given() {
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     // As cli/si may have written it: a name with surrounding whitespace.
     inventory
-        .set_host_variable(web1.id, " port", "80")
+        .set_variable(Owner::Host(web1.id), " port", "80")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web1.id, "port", "81")
+        .set_variable(Owner::Host(web1.id), "port", "81")
         .await
         .unwrap();
 
     inventory
-        .set_host_variable(web1.id, " port", "8080")
+        .set_variable(Owner::Host(web1.id), " port", "8080")
         .await
         .unwrap();
     assert_eq!(
@@ -436,7 +440,7 @@ async fn keeps_variable_names_exactly_as_given() {
     );
 
     inventory
-        .remove_host_variable(web1.id, " port")
+        .remove_variable(Owner::Host(web1.id), " port")
         .await
         .unwrap();
     assert_eq!(
@@ -451,7 +455,7 @@ async fn variables_of_an_unknown_host_are_not_found() {
     let inventory = open(&db).await;
 
     let err = inventory
-        .set_host_variable(42, "port", "80")
+        .set_variable(Owner::Host(42), "port", "80")
         .await
         .unwrap_err();
 
@@ -465,7 +469,7 @@ async fn removing_a_variable_of_an_unknown_host_is_not_found() {
     let inventory = open(&db).await;
 
     let err = inventory
-        .remove_host_variable(42, "port")
+        .remove_variable(Owner::Host(42), "port")
         .await
         .unwrap_err();
 
@@ -477,7 +481,7 @@ async fn removing_a_variable_of_an_unknown_host_is_not_found() {
 /// The Host's `server_index` Own Variable, as stored.
 async fn server_index(inventory: &Inventory, host_id: i64) -> Option<String> {
     inventory
-        .host_variables(host_id)
+        .own_variables(Owner::Host(host_id))
         .await
         .unwrap()
         .into_iter()
@@ -518,7 +522,7 @@ async fn ignores_server_indexes_that_are_not_positive_json_integers() {
         .zip(["7", "0", "-40", "12.5", "\"99\"", "null", "[100]", "1e3"])
     {
         inventory
-            .set_host_variable(host.id, SERVER_INDEX, value)
+            .set_variable(Owner::Host(host.id), SERVER_INDEX, value)
             .await
             .unwrap();
     }
@@ -696,7 +700,7 @@ async fn setting_a_duplicate_server_index_warns_naming_the_other_host() {
     let web2 = inventory.create_host("web2", None).await.unwrap().value;
 
     let done = inventory
-        .set_host_variable(web2.id, SERVER_INDEX, "1")
+        .set_variable(Owner::Host(web2.id), SERVER_INDEX, "1")
         .await
         .unwrap();
 
@@ -711,10 +715,10 @@ async fn renaming_a_host_keeps_its_identity_and_own_variables() {
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
-    let before = inventory.host_variables(web1.id).await.unwrap();
+    let before = inventory.own_variables(Owner::Host(web1.id)).await.unwrap();
 
     let renamed = inventory
         .rename_host(web1.id, "Web-01")
@@ -725,7 +729,10 @@ async fn renaming_a_host_keeps_its_identity_and_own_variables() {
     assert_eq!(renamed.id, web1.id);
     assert_eq!(renamed.name, "web-01");
     assert_eq!(inventory.host(web1.id).await.unwrap(), Some(renamed));
-    assert_eq!(inventory.host_variables(web1.id).await.unwrap(), before);
+    assert_eq!(
+        inventory.own_variables(Owner::Host(web1.id)).await.unwrap(),
+        before
+    );
 }
 
 #[tokio::test]
@@ -777,7 +784,7 @@ async fn the_delete_preview_lists_the_host_and_its_own_variables() {
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
 
@@ -798,11 +805,11 @@ async fn deleting_a_host_removes_exactly_what_the_preview_listed() {
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
     let web2 = inventory.create_host("web2", None).await.unwrap().value;
     inventory
-        .set_host_variable(web1.id, "port", "80")
+        .set_variable(Owner::Host(web1.id), "port", "80")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web2.id, "port", "81")
+        .set_variable(Owner::Host(web2.id), "port", "81")
         .await
         .unwrap();
     let preview = inventory.host_deletion(web1.id).await.unwrap();

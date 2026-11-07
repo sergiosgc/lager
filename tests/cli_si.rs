@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use common::{open, temp_db};
+use lager::inventory::Owner;
 
 /// Why `cli/si` can't run here, if it can't.
 fn missing_python() -> Option<String> {
@@ -78,20 +79,20 @@ async fn returns_the_host_variables_lager_set() {
         ("tls", r#"{"enabled": true, "min_version": 1.2}"#),
     ] {
         inventory
-            .set_host_variable(web1.id, name, value)
+            .set_variable(Owner::Host(web1.id), name, value)
             .await
             .unwrap();
     }
     inventory
-        .set_host_variable(web1.id, "port", "8443")
+        .set_variable(Owner::Host(web1.id), "port", "8443")
         .await
         .unwrap();
     inventory
-        .set_host_variable(web2.id, "gone", "1")
+        .set_variable(Owner::Host(web2.id), "gone", "1")
         .await
         .unwrap();
     inventory
-        .remove_host_variable(web2.id, "gone")
+        .remove_variable(Owner::Host(web2.id), "gone")
         .await
         .unwrap();
 
@@ -171,4 +172,52 @@ async fn lists_the_groups_lager_wrote_with_hosts_and_children() {
         "{listing:#}"
     );
     assert!(listing.get("gone").is_none(), "{listing:#}");
+}
+
+#[tokio::test]
+async fn lists_the_group_variables_lager_set() {
+    if let Some(reason) = missing_python() {
+        eprintln!("SKIPPED lists_the_group_variables_lager_set: {reason}");
+        return;
+    }
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web = inventory.create_group("web").await.unwrap().value;
+    let eu = inventory.create_group("eu").await.unwrap().value;
+    for (name, value) in [
+        ("ntp_server", r#""ntp.example.org""#),
+        ("ansible_group_priority", "10"),
+        ("dns", r#"["192.0.2.53"]"#),
+        ("gone", "1"),
+    ] {
+        inventory
+            .set_variable(Owner::Group(web.id), name, value)
+            .await
+            .unwrap();
+    }
+    inventory
+        .remove_variable(Owner::Group(web.id), "gone")
+        .await
+        .unwrap();
+    inventory
+        .set_variable(Owner::Group(eu.id), "dns", r#"["198.51.100.53"]"#)
+        .await
+        .unwrap();
+
+    let listing = run_si(&db.path, &["--list"]);
+
+    assert_eq!(
+        listing["web"]["vars"],
+        serde_json::json!({
+            "ntp_server": "ntp.example.org",
+            "ansible_group_priority": 10,
+            "dns": ["192.0.2.53"],
+        }),
+        "{listing:#}"
+    );
+    assert_eq!(
+        listing["eu"]["vars"],
+        serde_json::json!({"dns": ["198.51.100.53"]}),
+        "{listing:#}"
+    );
 }

@@ -81,7 +81,7 @@ impl Inventory {
             Some(value) => value.to_string(),
             None => next_server_index(&mut tx).await?.to_string(),
         };
-        write_host_variable(&mut tx, host.id, SERVER_INDEX, &index).await?;
+        write_variable(&mut tx, Owner::Host(host.id), SERVER_INDEX, &index).await?;
         let warnings = host_warnings(&mut tx, host.id).await?;
         tx.commit().await?;
         Ok(Done {
@@ -117,10 +117,7 @@ impl Inventory {
         let mut tx = db.transaction().await?;
         let plan = plan_host_deletion(&mut tx, host_id).await?;
         refuse_if_blocked("host", &plan.host.name, &plan.blockers)?;
-        models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
-            .delete()
-            .exec(&mut tx)
-            .await?;
+        delete_owner_values(&mut tx, Owner::Host(host_id)).await?;
         models::Membership::filter(models::Membership::fields().host_id().eq(host_id))
             .delete()
             .exec(&mut tx)
@@ -186,18 +183,7 @@ pub(super) async fn plan_host_deletion(
     host_id: i64,
 ) -> Result<HostDeletion, Error> {
     let host = existing_host(&mut *db, host_id).await?;
-    let values = models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
-        .exec(&mut *db)
-        .await?;
-    let own_variables = own_variables(
-        &mut *db,
-        values
-            .into_iter()
-            .map(|v| (v.variable_id, v.value))
-            .collect(),
-        Unnamed::Label,
-    )
-    .await?;
+    let own_variables = own_variables_to_delete(&mut *db, Owner::Host(host_id)).await?;
     let groups = host_groups(&mut *db, host_id).await?;
     let memberships =
         models::Membership::filter(models::Membership::fields().host_id().eq(host_id))

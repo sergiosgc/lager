@@ -374,3 +374,53 @@ async fn deleting_a_group_goes_through_a_confirmation() {
     assert_eq!(get(&router, &eu).await.status(), StatusCode::OK);
     assert_eq!(get(&router, &host).await.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn group_variables_show_as_effective_variables_with_their_source() {
+    let (_db, router) = app().await;
+    let web = create_group(&router, "web").await;
+    let host = create_host(&router, "web1").await;
+    post_form(
+        &router,
+        &format!("{web}/hosts"),
+        &format!("host={}", id_of(&host)),
+    )
+    .await;
+
+    let set = post_form(
+        &router,
+        &format!("{web}/variables"),
+        "form=add&name=port&value=80",
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::SEE_OTHER);
+    let rejected = post_form(
+        &router,
+        &format!("{web}/variables"),
+        "form=add&name=tls&value=yes",
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("This is not valid JSON"), "{page}");
+    assert!(page.contains(">yes</textarea>"), "{page}");
+
+    let page = text(get(&router, &host).await).await;
+    let effective = &page[page.find(r#"id="effective""#).unwrap()..];
+    assert!(effective.contains("<code>80</code>"), "{effective}");
+    assert!(
+        effective.contains(&format!(r#"href="{web}""#)),
+        "{effective}"
+    );
+
+    post_form(
+        &router,
+        &format!("{host}/variables"),
+        "form=add&name=port&value=8080",
+    )
+    .await;
+    let page = text(get(&router, &host).await).await;
+    let effective = &page[page.find(r#"id="effective""#).unwrap()..];
+    assert!(effective.contains("<code>8080</code>"), "{effective}");
+    assert!(effective.contains("overrides"), "{effective}");
+}

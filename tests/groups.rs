@@ -400,35 +400,6 @@ async fn deleting_a_group_removes_memberships_and_un_nests_its_children() {
 }
 
 #[tokio::test]
-async fn a_group_with_own_variables_cannot_be_deleted_yet() {
-    let db = temp_db();
-    let inventory = open(&db).await;
-    let web = group(&inventory, "web").await;
-    // Written by cli/si: Group Variables arrive with #11.
-    sql(
-        &db,
-        &format!(
-            "INSERT INTO variable(id, name) VALUES (1, 'ntp_server');
-             INSERT INTO host_group_variable(variable, \"group\", value) VALUES (1, {}, '\"ntp.example.org\"');",
-            web.id
-        ),
-    );
-
-    let preview = inventory.group_deletion(web.id).await.unwrap();
-    let err = inventory.delete_group(web.id).await.unwrap_err();
-
-    assert_eq!(
-        preview.blockers,
-        ["It has 1 Own Variable, and lager can't remove Group Variables yet."]
-    );
-    assert!(
-        matches!(err, Error::Invalid { field: "group", .. }),
-        "{err:?}"
-    );
-    assert!(inventory.group(web.id).await.unwrap().is_some());
-}
-
-#[tokio::test]
 async fn deleting_a_host_removes_its_memberships() {
     let db = temp_db();
     let inventory = open(&db).await;

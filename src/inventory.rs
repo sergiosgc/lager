@@ -13,7 +13,7 @@ mod variables;
 
 pub use groups::{Group, GroupDeletion, GroupTreeEntry};
 pub use hosts::{Host, HostDeletion, normalize_host_name};
-pub use variables::OwnVariable;
+pub use variables::{EffectiveVariable, OwnVariable, Owner, Source};
 
 use groups::*;
 use hosts::*;
@@ -212,7 +212,8 @@ async fn open_without_foreign_keys(path: &Path) -> toasty::Result<toasty::Db> {
             models::Variable,
             models::HostVariable,
             models::Group,
-            models::Membership
+            models::Membership,
+            models::GroupVariable
         ))
         .max_pool_size(1)
         .build(driver)

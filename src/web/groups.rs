@@ -15,8 +15,12 @@ use topcoat::{
 };
 
 use super::hosts::{HostId, host_detail};
+use super::variables::{
+    FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
+    own_variables_section, removed_variables_section,
+};
 use super::{inventory, page_error};
-use crate::inventory::{Group, GroupDeletion, Host};
+use crate::inventory::{EffectiveVariable, Group, GroupDeletion, Host, OwnVariable, Owner};
 
 topcoat::router::path_param!(pub(super) group_id: i64, error = not_found);
 
@@ -30,6 +34,8 @@ pub(super) struct GroupPage {
     members: Vec<Host>,
     /// Hosts that aren't members yet, to add.
     non_members: Vec<Host>,
+    variables: Vec<OwnVariable>,
+    effective: Vec<EffectiveVariable>,
 }
 
 async fn load_group_page(cx: &Cx, group: Group) -> Result<GroupPage> {
@@ -46,6 +52,10 @@ async fn load_group_page(cx: &Cx, group: Group) -> Result<GroupPage> {
         .filter(|h| !members.iter().any(|m| m.id == h.id))
         .collect();
     Ok(GroupPage {
+        variables: inventory.own_variables(Owner::Group(group.id)).await?,
+        effective: inventory
+            .effective_variables(Owner::Group(group.id))
+            .await?,
         group,
         parent,
         other_groups,
@@ -178,7 +188,7 @@ async fn group_name_view(
 pub(super) async fn group_detail(cx: &Cx) -> Result<impl View> {
     let group = path_group(cx).await?;
     let page = load_group_page(cx, group).await?;
-    Ok(view! { group_view(page: page, parent_error: None) })
+    Ok(view! { group_view(page: page, parent_error: None, failed: None) })
 }
 
 #[derive(Deserialize)]
@@ -197,7 +207,7 @@ pub(super) async fn set_group_parent(
         Ok(_) => Err(see_other(group_url(cx, group.id, "parent")).into()),
         Err(crate::inventory::Error::Invalid { message, .. }) => {
             let page = load_group_page(cx, group).await?;
-            Ok(view! { group_view(page: page, parent_error: Some(message)) })
+            Ok(view! { group_view(page: page, parent_error: Some(message), failed: None) })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -228,10 +238,52 @@ pub(super) async fn remove_group_host(cx: &Cx, Form(input): Form<HostChoice>) ->
     Err::<(), _>(see_other(group_url(cx, group.id, "members")).into())
 }
 
+#[page(POST "/groups/{group_id}/variables")]
+pub(super) async fn set_group_variable(
+    cx: &Cx,
+    Form(input): Form<VariableInput>,
+) -> Result<impl View> {
+    let group = path_group(cx).await?;
+    match inventory(cx)
+        .set_variable(Owner::Group(group.id), &input.name, &input.value)
+        .await
+    {
+        Ok(_) => Err(see_other(group_url(cx, group.id, "variables")).into()),
+        Err(crate::inventory::Error::Invalid { field, message }) => {
+            let page = load_group_page(cx, group).await?;
+            let failed = FailedVariable {
+                input,
+                field,
+                message,
+            };
+            Ok(view! { group_view(page: page, parent_error: None, failed: Some(failed)) })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+#[page(POST "/groups/{group_id}/variables/remove")]
+pub(super) async fn remove_group_variable(
+    cx: &Cx,
+    Form(input): Form<RemoveVariable>,
+) -> Result<impl View> {
+    let group = path_group(cx).await?;
+    inventory(cx)
+        .remove_variable(Owner::Group(group.id), &input.name)
+        .await
+        .map_err(page_error)?;
+    Err::<(), _>(see_other(group_url(cx, group.id, "variables")).into())
+}
+
 /// A Group's page. `parent_error` is a rejected Parent Group change, shown
-/// next to its form.
+/// next to its form; `failed` a rejected Variable submission.
 #[component]
-async fn group_view(page: GroupPage, parent_error: Option<String>) -> Result<impl View> {
+async fn group_view(
+    cx: &Cx,
+    page: GroupPage,
+    parent_error: Option<String>,
+    failed: Option<FailedVariable>,
+) -> Result<impl View> {
     let GroupPage {
         group,
         parent,
@@ -239,10 +291,12 @@ async fn group_view(page: GroupPage, parent_error: Option<String>) -> Result<imp
         children,
         members,
         non_members,
+        variables,
+        effective,
     } = page;
     let group_id = group.id;
     Ok(view! {
-        if parent_error.is_some() {
+        if parent_error.is_some() || failed.is_some() {
             (StatusCode::UNPROCESSABLE_ENTITY)
         }
         <p><a href=(href!(groups_list))>"All Groups"</a></p>
@@ -330,6 +384,15 @@ async fn group_view(page: GroupPage, parent_error: Option<String>) -> Result<imp
                 <button type="submit">"Add"</button>
             </form>
         }
+
+        own_variables_section(
+            set_url: href!(set_group_variable, GroupId(group_id)).resolve(cx),
+            remove_url: href!(remove_group_variable, GroupId(group_id)).resolve(cx),
+            variables: variables,
+            failed: failed,
+            empty: "This Group has no Own Variables.".to_string(),
+        )
+        effective_variables_section(effective: effective)
     })
 }
 
@@ -363,6 +426,7 @@ async fn delete_group_view(deletion: GroupDeletion, refused: bool) -> Result<imp
         group,
         member_hosts,
         child_groups,
+        own_variables,
         missing_memberships,
         blockers,
     } = deletion;
@@ -385,6 +449,7 @@ async fn delete_group_view(deletion: GroupDeletion, refused: bool) -> Result<imp
             <p><a href=(href!(group_detail, GroupId(group_id)))>"Back to " (name)</a></p>
         } else {
             <p>"This removes the Group " <strong>(name.clone())</strong> "."</p>
+            removed_variables_section(variables: own_variables)
             <h2>"Hosts leaving it"</h2>
             if member_hosts.is_empty() {
                 <p>"None: no Host is directly in it."</p>
