@@ -159,6 +159,7 @@ async fn maps_every_table_including_renamed_relation_keys() {
     // Check the real columns with plain SQLite, bypassing Toasty.
     let conn = rusqlite::Connection::open(&f.path).unwrap();
     let q = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    let eu_id = eu.id;
     assert_eq!(
         q(r#"SELECT h.name || '/' || g.name FROM host_group_membership m
              JOIN host h ON h.id = m.host JOIN host_group g ON g.id = m."group""#),
@@ -174,10 +175,17 @@ async fn maps_every_table_including_renamed_relation_keys() {
         "mariadb@web1:main=192.0.2.10"
     );
     assert_eq!(
-        q(r#"SELECT v.name || '=' || gv.value FROM host_group_variable gv
-             JOIN variable v ON v.id = gv.variable WHERE gv."group" = 2"#),
+        conn.query_row(
+            r#"SELECT v.name || '=' || gv.value FROM host_group_variable gv
+               JOIN variable v ON v.id = gv.variable WHERE gv."group" = ?1"#,
+            [eu_id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap(),
         "ntp_server=\"ntp.eu.example\""
     );
+    drop(conn);
+    assert_eq!(schema_of(&f.path), schema_of(&reference_db()));
 }
 
 /// The Effective Variables of a Host through its Groups and Parent Groups,
@@ -277,9 +285,11 @@ async fn foreign_keys_stay_off_after_errors_and_transactions() {
     let r = rows(toasty::sql::query("PRAGMA foreign_keys").exec(&mut f.db).await.unwrap());
     assert_eq!(r[0][0], Value::I64(0));
     assert_eq!(Group::all().exec(&mut f.db).await.unwrap().len(), 2);
+    assert_eq!(schema_of(&f.path), schema_of(&reference_db()));
 }
 
-/// The schema allows NULL names; record what Toasty does with one.
+/// Finding: the schema allows NULL names (ADR 0003), but a name mapped as
+/// `String` makes any query that loads such a row fail, not just that row.
 #[tokio::test]
 async fn reading_a_null_name() {
     let mut f = fixture().await;
@@ -287,6 +297,6 @@ async fn reading_a_null_name() {
         .unwrap()
         .execute("INSERT INTO host(name) VALUES (NULL)", [])
         .unwrap();
-    let result = Host::all().exec(&mut f.db).await;
-    eprintln!("NULL name read as String field: {result:?}");
+    let err = Host::all().exec(&mut f.db).await.unwrap_err();
+    assert!(err.to_string().contains("cannot convert Null to String"), "{err}");
 }
