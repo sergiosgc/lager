@@ -60,3 +60,54 @@ async fn lists_a_host_lager_created() {
         .unwrap_or_else(|| panic!("no _meta.hostvars in cli/si --list output:\n{listing:#}"));
     assert_eq!(hostvars.keys().collect::<Vec<_>>(), ["web1"], "{listing:#}");
 }
+
+#[tokio::test]
+async fn returns_the_host_variables_lager_set() {
+    if let Some(reason) = missing_python() {
+        eprintln!("SKIPPED returns_the_host_variables_lager_set: {reason}");
+        return;
+    }
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web2 = inventory.create_host("web2").await.unwrap().value;
+    for (name, value) in [
+        ("ntp_server", r#""ntp.example.org""#),
+        ("port", "8080"),
+        ("dns", r#"["192.0.2.53", "192.0.2.54"]"#),
+        ("tls", r#"{"enabled": true, "min_version": 1.2}"#),
+    ] {
+        inventory
+            .set_host_variable(web1.id, name, value)
+            .await
+            .unwrap();
+    }
+    inventory
+        .set_host_variable(web1.id, "port", "8443")
+        .await
+        .unwrap();
+    inventory
+        .set_host_variable(web2.id, "gone", "1")
+        .await
+        .unwrap();
+    inventory
+        .remove_host_variable(web2.id, "gone")
+        .await
+        .unwrap();
+
+    let web1_vars = run_si(&db.path, &["--host", "web1"]);
+    let web2_vars = run_si(&db.path, &["--host", "web2"]);
+
+    for (name, expected) in [
+        ("ntp_server", serde_json::json!("ntp.example.org")),
+        ("port", serde_json::json!(8443)),
+        ("dns", serde_json::json!(["192.0.2.53", "192.0.2.54"])),
+        (
+            "tls",
+            serde_json::json!({"enabled": true, "min_version": 1.2}),
+        ),
+    ] {
+        assert_eq!(web1_vars[name], expected, "{name} in:\n{web1_vars:#}");
+    }
+    assert!(web2_vars.get("gone").is_none(), "{web2_vars:#}");
+}

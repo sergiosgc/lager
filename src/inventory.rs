@@ -34,6 +34,13 @@ impl From<models::Host> for Host {
     }
 }
 
+/// A Variable set directly on an entity, with its value as JSON text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnVariable {
+    pub name: String,
+    pub value: String,
+}
+
 /// The result of a successful change, with anything the operator should
 /// notice but that didn't stop it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +66,8 @@ pub enum Error {
         field: &'static str,
         message: String,
     },
+    /// The entity the change was aimed at doesn't exist.
+    NotFound(String),
     Database(toasty::Error),
 }
 
@@ -66,6 +75,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Invalid { field, message } => write!(f, "{field}: {message}"),
+            Error::NotFound(what) => write!(f, "{what} not found"),
             Error::Database(e) => write!(f, "database error: {e}"),
         }
     }
@@ -190,6 +200,176 @@ impl Inventory {
         tx.commit().await?;
         Ok(Done::ok(host.into()))
     }
+
+    /// A Host's Own Variables, sorted by name.
+    pub async fn host_variables(&self, host_id: i64) -> Result<Vec<OwnVariable>, Error> {
+        let mut db = self.db.clone();
+        let values =
+            models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
+                .exec(&mut db)
+                .await?;
+        own_variables(
+            &mut db,
+            values
+                .into_iter()
+                .map(|v| (v.variable_id, v.value))
+                .collect(),
+        )
+        .await
+    }
+
+    /// Sets a Host's Own Variable, adding the Variable name if it is new.
+    ///
+    /// The name must not be blank, and is used exactly as given. The value
+    /// must parse as JSON, and is stored exactly as given, as `cli/si` does.
+    pub async fn set_host_variable(
+        &self,
+        host_id: i64,
+        name: &str,
+        value: &str,
+    ) -> Result<Done<OwnVariable>, Error> {
+        valid_variable_name(name)?;
+        valid_json(value)?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        existing_host(&mut tx, host_id).await?;
+        let variable_id = match variable_by_name(&mut tx, name).await? {
+            Some(variable) => variable.id,
+            None => {
+                models::Variable::create()
+                    .name(name)
+                    .exec(&mut tx)
+                    .await?
+                    .id
+            }
+        };
+        match host_variable(variable_id, host_id)
+            .first()
+            .exec(&mut tx)
+            .await?
+        {
+            Some(mut row) => row.update().value(value).exec(&mut tx).await?,
+            None => {
+                models::HostVariable::create()
+                    .variable_id(variable_id)
+                    .host_id(host_id)
+                    .value(value)
+                    .exec(&mut tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(Done::ok(OwnVariable {
+            name: name.to_string(),
+            value: value.to_string(),
+        }))
+    }
+
+    /// Removes a Host's Own Variable. The Variable name stays, for any other
+    /// entity using it. Removing a Variable the Host doesn't have does nothing.
+    pub async fn remove_host_variable(&self, host_id: i64, name: &str) -> Result<Done<()>, Error> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        existing_host(&mut tx, host_id).await?;
+        if let Some(variable) = variable_by_name(&mut tx, name).await? {
+            host_variable(variable.id, host_id)
+                .delete()
+                .exec(&mut tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(Done::ok(()))
+    }
+
+    /// Every Variable name, sorted, whether or not any entity has a value
+    /// for it.
+    pub async fn variable_names(&self) -> Result<Vec<String>, Error> {
+        let mut db = self.db.clone();
+        let mut names: Vec<String> = models::Variable::all()
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+}
+
+/// Pairs each `(variable id, value)` with its Variable name, sorted by name.
+/// A value whose Variable row is missing is left out, as `cli/si`'s joins do.
+async fn own_variables(
+    db: &mut toasty::Db,
+    values: Vec<(i64, String)>,
+) -> Result<Vec<OwnVariable>, Error> {
+    let ids: Vec<i64> = values.iter().map(|(id, _)| *id).collect();
+    let names: std::collections::HashMap<i64, String> =
+        models::Variable::filter(toasty::stmt::in_list(models::Variable::fields().id(), ids))
+            .exec(db)
+            .await?
+            .into_iter()
+            .map(|v| (v.id, v.name))
+            .collect();
+    let mut own: Vec<OwnVariable> = values
+        .into_iter()
+        .filter_map(|(id, value)| {
+            names.get(&id).map(|name| OwnVariable {
+                name: name.clone(),
+                value,
+            })
+        })
+        .collect();
+    own.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(own)
+}
+
+/// Fails with [`Error::NotFound`] unless the Host exists.
+async fn existing_host(tx: &mut toasty::Transaction<'_>, host_id: i64) -> Result<(), Error> {
+    match models::Host::filter_by_id(host_id).first().exec(tx).await? {
+        Some(_) => Ok(()),
+        None => Err(Error::NotFound(format!("Host {host_id}"))),
+    }
+}
+
+/// The Variable called exactly `name`, if there is one.
+async fn variable_by_name(
+    tx: &mut toasty::Transaction<'_>,
+    name: &str,
+) -> Result<Option<models::Variable>, Error> {
+    Ok(
+        models::Variable::filter(models::Variable::fields().name().eq(name))
+            .first()
+            .exec(tx)
+            .await?,
+    )
+}
+
+/// The query for one Host's value of one Variable.
+fn host_variable(
+    variable_id: i64,
+    host_id: i64,
+) -> toasty::schema::QueryMany<models::HostVariable> {
+    models::HostVariable::filter(
+        models::HostVariable::fields()
+            .variable_id()
+            .eq(variable_id)
+            .and(models::HostVariable::fields().host_id().eq(host_id)),
+    )
+}
+
+/// Rejects a blank Variable name.
+fn valid_variable_name(name: &str) -> Result<(), Error> {
+    if name.trim().is_empty() {
+        return Err(invalid("name", "A Variable name can't be empty."));
+    }
+    Ok(())
+}
+
+/// Checks that a Variable value is a JSON document.
+fn valid_json(value: &str) -> Result<(), Error> {
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(|_| ())
+        .map_err(|e| invalid("value", format!("This is not valid JSON: {e}.")))
 }
 
 /// The name a Host is stored under: lowercased, keeping only `a`-`z`,
@@ -223,7 +403,11 @@ fn invalid(field: &'static str, message: impl Into<String>) -> Error {
 async fn open_without_foreign_keys(path: &Path) -> toasty::Result<toasty::Db> {
     let driver = toasty_driver_sqlite::Sqlite::open(path);
     let mut db = toasty::Db::builder()
-        .models(toasty::models!(models::Host))
+        .models(toasty::models!(
+            models::Host,
+            models::Variable,
+            models::HostVariable
+        ))
         .max_pool_size(1)
         .build(driver)
         .await?;

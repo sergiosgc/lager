@@ -82,3 +82,68 @@ async fn an_unknown_host_is_not_found() {
         StatusCode::NOT_FOUND
     );
 }
+
+/// Creates a Host through the form and returns its page's path.
+async fn create_host(router: &Router, name: &str) -> String {
+    location(&post_form(router, "/hosts/new", &format!("name={name}")).await)
+}
+
+#[tokio::test]
+async fn sets_edits_and_removes_a_host_variable_from_its_page() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let variables = format!("{host}/variables");
+
+    let added = post_form(&router, &variables, "form=add&name=port&value=80").await;
+    assert_eq!(added.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&added), format!("{host}#variables"));
+    let page = text(get(&router, &host).await).await;
+    assert!(page.contains(r#"<th scope="row">port</th>"#), "{page}");
+    assert!(page.contains(">80</textarea>"), "{page}");
+
+    let edited = post_form(&router, &variables, "form=edit&name=port&value=8080").await;
+    assert_eq!(edited.status(), StatusCode::SEE_OTHER);
+    assert!(
+        text(get(&router, &host).await)
+            .await
+            .contains(">8080</textarea>")
+    );
+
+    let removed = post_form(&router, &format!("{variables}/remove"), "name=port").await;
+    assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+    let page = text(get(&router, &host).await).await;
+    assert!(page.contains("This Host has no Own Variables."), "{page}");
+}
+
+#[tokio::test]
+async fn invalid_json_re_renders_the_host_page_with_the_error_and_input() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let variables = format!("{host}/variables");
+    post_form(&router, &variables, "form=add&name=port&value=80").await;
+
+    let rejected = post_form(
+        &router,
+        &variables,
+        "form=add&name=ntp&value=ntp.example.org",
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("This is not valid JSON"), "{page}");
+    assert!(page.contains(r#"value="ntp""#), "{page}");
+    assert!(page.contains(">ntp.example.org</textarea>"), "{page}");
+
+    let rejected = post_form(&router, &variables, "form=edit&name=port&value=%5B1%2C").await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("This is not valid JSON"), "{page}");
+    assert!(page.contains(">[1,</textarea>"), "{page}");
+
+    let rejected = post_form(&router, &variables, "form=add&name=+&value=%22x%22").await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("A Variable name can"), "{page}");
+    assert!(page.contains(r#"value=" ""#), "{page}");
+    assert!(page.contains(">\"x\"</textarea>"), "{page}");
+}
