@@ -142,6 +142,7 @@ pub(super) async fn host_instances_list(instances: Vec<ServiceInstance>) -> Resu
                             " at " <code>(instance.ip.clone())</code>
                             " · "
                             <a href=(href!(clone_instance_form, InstanceId(instance.id)))
+                                class="button"
                                 aria-label=(format!("Clone {}", instance.label()))
                             >"Clone…"</a>
                         </li>
