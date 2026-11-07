@@ -1,16 +1,101 @@
-//! Variables on entity pages: the Own Variables editor and the Effective
-//! Variables table, shared by Host and Group pages.
+//! Variables: the Variables page listing every name and where it is used,
+//! and the pieces entity pages share: the Own Variables editor and the
+//! Effective Variables table.
 
 use serde::Deserialize;
 use topcoat::{
     Result,
-    router::href,
+    context::Cx,
+    router::{href, page},
     view::{View, component, view},
 };
 
 use super::groups::{GroupId, group_detail};
+use super::hosts::{HostId, host_detail};
+use super::inventory;
+use super::service_instances::{InstanceId, instance_detail};
 use super::services::{ServiceId, service_detail};
-use crate::inventory::{EffectiveVariable, OwnVariable, Source};
+use crate::inventory::{EffectiveVariable, OwnVariable, Owner, OwnerKind, Source};
+
+/// The id of a Variable's entry on the Variables page. Derived from the
+/// name (hex-encoded, so any name gives a valid, unique id).
+fn variable_anchor(name: &str) -> String {
+    let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("variable-{hex}")
+}
+
+/// The link to a Variable's entry on the Variables page.
+fn variable_link(cx: &Cx, name: &str) -> String {
+    format!(
+        "{}#{}",
+        href!(variables_list).resolve(cx),
+        variable_anchor(name)
+    )
+}
+
+#[page("/variables")]
+pub(super) async fn variables_list(cx: &Cx) -> Result<impl View> {
+    let variables = inventory(cx).variable_usages().await?;
+    Ok(view! {
+        <h1>"Variables"</h1>
+        <p class="hint">"Every Variable name, and where it is set as an Own Variable."</p>
+        if variables.is_empty() {
+            <p>"There are no Variables yet."</p>
+        }
+        #[key(variable.name.clone())]
+        for variable in variables {
+            <section id=(variable_anchor(&variable.name))>
+                <h2>(variable.name.clone())</h2>
+                if variable.usages.is_empty() {
+                    <p class="hint">"Unused: nothing sets it."</p>
+                } else {
+                    <table>
+                        <thead><tr><th>"Set on"</th><th>"Value"</th></tr></thead>
+                        <tbody>
+                            for usage in variable.usages {
+                                <tr>
+                                    <td>
+                                        (kind_label(usage.owner.kind())) " "
+                                        match usage.owner_name {
+                                            Some(name) => owner_link(owner: usage.owner, name: name),
+                                            None => {
+                                                (usage.owner.id())
+                                                <span class="hint">" (no longer exists)"</span>
+                                            },
+                                        }
+                                    </td>
+                                    <td><code>(usage.value)</code></td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </section>
+        }
+    })
+}
+
+fn kind_label(kind: OwnerKind) -> &'static str {
+    match kind {
+        OwnerKind::Host => "Host",
+        OwnerKind::Group => "Group",
+        OwnerKind::Service => "Service",
+        OwnerKind::ServiceInstance => "Service Instance",
+    }
+}
+
+/// A link to an entity's page.
+#[component]
+async fn owner_link(owner: Owner, name: String) -> Result<impl View> {
+    Ok(view! {
+        match owner {
+            Owner::Host(id) => <a href=(href!(host_detail, HostId(id)))>(name)</a>,
+            Owner::Group(id) => <a href=(href!(group_detail, GroupId(id)))>(name)</a>,
+            Owner::Service(id) => <a href=(href!(service_detail, ServiceId(id)))>(name)</a>,
+            Owner::ServiceInstance(id) => <a href=(href!(instance_detail, InstanceId(id)))>(name)</a>,
+        }
+    })
+}
 
 /// Which Variable form a rejected submission came from.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +132,7 @@ pub(super) struct RemoveVariable {
 /// `empty` is what to say when there are none.
 #[component]
 pub(super) async fn own_variables_section(
+    cx: &Cx,
     set_url: String,
     remove_url: String,
     variables: Vec<OwnVariable>,
@@ -92,9 +178,13 @@ pub(super) async fn own_variables_section(
                             .filter(|f| f.input.name == variable.name);
                         let value = failure.map_or(variable.value.clone(), |f| f.input.value.clone());
                         let error = failure.map(|f| f.message.clone());
-                        let error_id = format!("variable-error-{}", variable.name);
+                        let error_id = format!("{}-error", variable_anchor(&variable.name));
                         <tr>
-                            <th scope="row">(variable.name.clone())</th>
+                            <th scope="row">
+                                <a href=(variable_link(cx, &variable.name))
+                                    title="Where else this Variable is used"
+                                >(variable.name.clone())</a>
+                            </th>
                             <td>
                                 <form method="post" action=(set_url.clone())>
                                     <input type="hidden" name="form" value="edit">

@@ -269,7 +269,7 @@ pub(super) async fn delete_instances(
 }
 
 /// Adds the Service and Host names to Service Instance rows.
-async fn describe(
+pub(super) async fn describe(
     db: &mut impl toasty::Executor,
     rows: Vec<models::ServiceInstance>,
 ) -> Result<Vec<ServiceInstance>, Error> {

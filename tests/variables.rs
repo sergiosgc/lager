@@ -4,7 +4,9 @@
 mod common;
 
 use common::{open, rows_referring_to, sql, temp_db};
-use lager::inventory::{EffectiveVariable, Error, Group, Inventory, OwnVariable, Owner, Source};
+use lager::inventory::{
+    EffectiveVariable, Error, Group, Inventory, OwnVariable, Owner, Source, VariableUsage,
+};
 
 async fn group(inventory: &Inventory, name: &str) -> Group {
     inventory.create_group(name).await.unwrap().value
@@ -488,4 +490,135 @@ async fn effective_variables_of_an_unknown_owner_are_not_found() {
         let err = inventory.effective_variables(owner).await.unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "{err:?}");
     }
+}
+
+// The Variables page: every name and where it is used
+
+#[tokio::test]
+async fn lists_every_variable_name_with_its_usages_across_all_kinds() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web = group(&inventory, "web").await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let nginx = inventory.create_service("nginx").await.unwrap().value;
+    let main = inventory
+        .create_service_instance(web1.id, nginx.id, "main", "192.0.2.10")
+        .await
+        .unwrap()
+        .value;
+    set(&inventory, Owner::Host(web1.id), "port", "8080").await;
+    set(&inventory, Owner::Group(web.id), "port", "80").await;
+    set(&inventory, Owner::Service(nginx.id), "port", "81").await;
+    set(&inventory, Owner::ServiceInstance(main.id), "port", "82").await;
+    set(&inventory, Owner::Group(web.id), "gone", "1").await;
+    inventory
+        .remove_variable(Owner::Group(web.id), "gone")
+        .await
+        .unwrap();
+
+    let usages = inventory.variable_usages().await.unwrap();
+
+    let names: Vec<&str> = usages.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["gone", "port", "server_index"]);
+    assert!(usages[0].usages.is_empty(), "gone is unused");
+    let port: Vec<(Owner, &str, &str)> = usages[1]
+        .usages
+        .iter()
+        .map(|u| (u.owner, u.owner_name.as_deref().unwrap(), u.value.as_str()))
+        .collect();
+    assert_eq!(
+        port,
+        [
+            (Owner::Host(web1.id), "web1", "8080"),
+            (Owner::Group(web.id), "web", "80"),
+            (Owner::Service(nginx.id), "nginx", "81"),
+            (Owner::ServiceInstance(main.id), "nginx main on web1", "82"),
+        ]
+    );
+    assert_eq!(usages[2].usages.len(), 1, "web1's server_index");
+}
+
+#[tokio::test]
+async fn usages_are_sorted_by_kind_then_name() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let z = group(&inventory, "z").await;
+    let a = group(&inventory, "a").await;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    for owner in [
+        Owner::Group(z.id),
+        Owner::Host(web2.id),
+        Owner::Group(a.id),
+        Owner::Host(web1.id),
+    ] {
+        set(&inventory, owner, "port", "1").await;
+    }
+
+    let usages = inventory.variable_usages().await.unwrap();
+
+    let port = usages.iter().find(|v| v.name == "port").unwrap();
+    let owners: Vec<&str> = port
+        .usages
+        .iter()
+        .map(|u| u.owner_name.as_deref().unwrap())
+        .collect();
+    assert_eq!(owners, ["web1", "web2", "a", "z"]);
+}
+
+#[tokio::test]
+async fn usages_of_entities_that_no_longer_exist_are_labelled() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    set(
+        &inventory,
+        Owner::Group(group(&inventory, "web").await.id),
+        "port",
+        "80",
+    )
+    .await;
+    // A value left behind by cli/si for a Host it deleted.
+    sql(
+        &db,
+        "INSERT INTO host_variable(variable, host, value) SELECT id, 999, '1' FROM variable WHERE name = 'port';",
+    );
+
+    let usages = inventory.variable_usages().await.unwrap();
+
+    let port = usages.iter().find(|v| v.name == "port").unwrap();
+    let missing = port
+        .usages
+        .iter()
+        .find(|u| u.owner == Owner::Host(999))
+        .unwrap();
+    assert_eq!(missing.owner_name, None);
+}
+
+#[tokio::test]
+async fn variable_rows_sharing_a_name_are_listed_once() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web = group(&inventory, "web").await;
+    let eu = group(&inventory, "eu").await;
+    set(&inventory, Owner::Group(web.id), "port", "80").await;
+    // cli/si doesn't keep Variable names unique (#1): a second "port" row.
+    sql(
+        &db,
+        &format!(
+            "INSERT INTO variable(id, name) VALUES (500, 'port');
+             INSERT INTO host_group_variable(variable, \"group\", value) VALUES (500, {}, '81');",
+            eu.id
+        ),
+    );
+
+    let usages = inventory.variable_usages().await.unwrap();
+
+    let ports: Vec<&VariableUsage> = usages.iter().filter(|v| v.name == "port").collect();
+    assert_eq!(ports.len(), 1);
+    let owners: Vec<Option<&str>> = ports[0]
+        .usages
+        .iter()
+        .map(|u| u.owner_name.as_deref())
+        .collect();
+    assert_eq!(owners, [Some("eu"), Some("web")]);
 }

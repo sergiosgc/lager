@@ -76,6 +76,7 @@ pub fn router(inventory: Inventory) -> Router {
         .page(service_instances::delete_instance)
         .page(service_instances::clone_instance_form)
         .page(service_instances::clone_instance)
+        .page(variables::variables_list)
         .build()
 }
 
@@ -119,6 +120,7 @@ async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
                     <a href=(href!(hosts::hosts_list))>"Hosts"</a>
                     <a href=(href!(groups::groups_list))>"Groups"</a>
                     <a href=(href!(services::services_list))>"Services"</a>
+                    <a href=(href!(variables::variables_list))>"Variables"</a>
                 </nav>
                 <main>(slot)</main>
             </body>

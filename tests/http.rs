@@ -651,3 +651,55 @@ async fn clones_a_service_instance_from_the_host_page() {
             .contains("web2 already has a Service Instance of nginx named main")
     );
 }
+
+#[tokio::test]
+async fn the_variables_page_lists_every_usage_and_entity_pages_link_to_it() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let web = create_group(&router, "web").await;
+    post_form(
+        &router,
+        &format!("{host}/variables"),
+        "form=add&name=ntp+server&value=%22a%22",
+    )
+    .await;
+    post_form(
+        &router,
+        &format!("{web}/variables"),
+        "form=add&name=ntp+server&value=%22b%22",
+    )
+    .await;
+    post_form(
+        &router,
+        &format!("{web}/variables"),
+        "form=add&name=gone&value=1",
+    )
+    .await;
+    post_form(&router, &format!("{web}/variables/remove"), "name=gone").await;
+
+    let page = text(get(&router, "/variables").await).await;
+    let ntp = &page[page.find(">ntp server<").expect("ntp server listed")..];
+    assert!(ntp.contains(&format!(r#"href="{host}""#)), "{page}");
+    assert!(ntp.contains(&format!(r#"href="{web}""#)), "{page}");
+    assert!(
+        ntp.contains("<code>&quot;a&quot;</code>") || ntp.contains(r#"<code>"a"</code>"#),
+        "{page}"
+    );
+    let gone = &page[page.find(">gone<").expect("gone listed")..];
+    assert!(
+        gone[..gone.find("</section>").unwrap()].contains("Unused"),
+        "{page}"
+    );
+
+    // The entry's id is the hex-encoded name, and the Host page links its
+    // Own Variable back to it.
+    assert!(
+        page.contains(r#"<section id="variable-6e747020736572766572">"#),
+        "{page}"
+    );
+    let host_page = text(get(&router, &host).await).await;
+    assert!(
+        host_page.contains(r#"href="/variables#variable-6e747020736572766572""#),
+        "{host_page}"
+    );
+}

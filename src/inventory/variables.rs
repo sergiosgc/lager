@@ -16,7 +16,7 @@ pub struct OwnVariable {
 }
 
 /// An entity that can have Own Variables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Owner {
     Host(i64),
     Group(i64),
@@ -24,20 +24,61 @@ pub enum Owner {
     ServiceInstance(i64),
 }
 
-impl Owner {
+/// A kind of entity that can have Own Variables, in the order the Variables
+/// page lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OwnerKind {
+    Host,
+    Group,
+    Service,
+    ServiceInstance,
+}
+
+impl OwnerKind {
+    const ALL: [OwnerKind; 4] = [
+        OwnerKind::Host,
+        OwnerKind::Group,
+        OwnerKind::Service,
+        OwnerKind::ServiceInstance,
+    ];
+
     /// The table holding this kind of entity's Variable values, and the
     /// column naming the entity (quoted where it's a reserved word). The
     /// values are read and written with SQL built from these (ADR 0005).
     fn value_table(self) -> (&'static str, &'static str) {
         match self {
-            Owner::Host(_) => ("host_variable", "host"),
-            Owner::Group(_) => ("host_group_variable", r#""group""#),
-            Owner::Service(_) => ("service_variable", "service"),
-            Owner::ServiceInstance(_) => ("service_instance_variable", "instance"),
+            OwnerKind::Host => ("host_variable", "host"),
+            OwnerKind::Group => ("host_group_variable", r#""group""#),
+            OwnerKind::Service => ("service_variable", "service"),
+            OwnerKind::ServiceInstance => ("service_instance_variable", "instance"),
         }
     }
 
-    fn id(self) -> i64 {
+    fn owner(self, id: i64) -> Owner {
+        match self {
+            OwnerKind::Host => Owner::Host(id),
+            OwnerKind::Group => Owner::Group(id),
+            OwnerKind::Service => Owner::Service(id),
+            OwnerKind::ServiceInstance => Owner::ServiceInstance(id),
+        }
+    }
+}
+
+impl Owner {
+    pub fn kind(self) -> OwnerKind {
+        match self {
+            Owner::Host(_) => OwnerKind::Host,
+            Owner::Group(_) => OwnerKind::Group,
+            Owner::Service(_) => OwnerKind::Service,
+            Owner::ServiceInstance(_) => OwnerKind::ServiceInstance,
+        }
+    }
+
+    fn value_table(self) -> (&'static str, &'static str) {
+        self.kind().value_table()
+    }
+
+    pub fn id(self) -> i64 {
         match self {
             Owner::Host(id)
             | Owner::Group(id)
@@ -68,6 +109,25 @@ pub struct EffectiveVariable {
     /// The next source in line that also sets this Variable, whose value
     /// the winning one hides, if any.
     pub overrides: Option<Source>,
+}
+
+/// A Variable name and every place it is set as an Own Variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableUsage {
+    pub name: String,
+    /// By kind of entity (Hosts, Groups, Services, Service Instances), then
+    /// by the entity's name. Empty for an unused name.
+    pub usages: Vec<Usage>,
+}
+
+/// One entity's Own Variable value for a Variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    pub owner: Owner,
+    /// The entity's name ("nginx main on web1" for a Service Instance), or
+    /// `None` if it no longer exists (cli/si can leave values behind).
+    pub owner_name: Option<String>,
+    pub value: String,
 }
 
 /// The Group Variable Ansible uses to rank Groups at the same distance.
@@ -169,6 +229,52 @@ impl Inventory {
             }
         });
         resolve(&mut db, layers).await
+    }
+
+    /// Every Variable name, sorted, with every place it is set as an Own
+    /// Variable. Values whose Variable name is missing are left out.
+    pub async fn variable_usages(&self) -> Result<Vec<VariableUsage>, Error> {
+        let mut db = self.db.clone();
+        // Keyed by name: rows sharing a name (possible in cli/si data, #1)
+        // are listed once, with all their usages.
+        let names_by_id: HashMap<i64, String> = models::Variable::all()
+            .exec(&mut db)
+            .await?
+            .into_iter()
+            .map(|v| (v.id, v.name))
+            .collect();
+        let mut usages: HashMap<&str, Vec<Usage>> = names_by_id
+            .values()
+            .map(|name| (name.as_str(), Vec::new()))
+            .collect();
+        let entities = entity_names(&mut db).await?;
+        for kind in OwnerKind::ALL {
+            for (variable_id, owner_id, value) in all_values(&mut db, kind).await? {
+                let Some(name) = names_by_id.get(&variable_id) else {
+                    continue;
+                };
+                let owner = kind.owner(owner_id);
+                usages.entry(name).or_default().push(Usage {
+                    owner,
+                    owner_name: entities.get(&owner).cloned(),
+                    value,
+                });
+            }
+        }
+        let mut variables: Vec<VariableUsage> = usages
+            .into_iter()
+            .map(|(name, mut usages)| {
+                usages.sort_by(|a, b| {
+                    (a.owner.kind(), &a.owner_name).cmp(&(b.owner.kind(), &b.owner_name))
+                });
+                VariableUsage {
+                    name: name.to_string(),
+                    usages,
+                }
+            })
+            .collect();
+        variables.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(variables)
     }
 
     /// Every Variable name, sorted, whether or not any entity has a value
@@ -366,6 +472,61 @@ pub(super) async fn existing_owner(
     }
 }
 
+/// Every value of one kind of entity, as `(variable id, entity id, value)`.
+async fn all_values(
+    db: &mut impl toasty::Executor,
+    kind: OwnerKind,
+) -> Result<Vec<(i64, i64, String)>, Error> {
+    let (table, column) = kind.value_table();
+    let sql = format!("SELECT variable, {column}, value FROM {table}");
+    let rows = toasty::sql::query(&sql).exec(db).await?;
+    decode_rows(&sql, rows, |row| match row {
+        [
+            Value::I64(variable),
+            Value::I64(owner),
+            Value::String(value),
+        ] => Some((*variable, *owner, value.clone())),
+        _ => None,
+    })
+}
+
+/// Decodes raw SQL rows with `decode`, which sees each row's columns. A row
+/// it can't decode is an error naming the query.
+fn decode_rows<T>(
+    sql: &str,
+    rows: Vec<Value>,
+    decode: impl Fn(&[Value]) -> Option<T>,
+) -> Result<Vec<T>, Error> {
+    rows.into_iter()
+        .map(|row| {
+            let columns: Vec<Value> = match row {
+                Value::Record(r) => r.into_iter().collect(),
+                other => vec![other],
+            };
+            decode(&columns).ok_or_else(|| Error::Unexpected(format!("{sql} returned {columns:?}")))
+        })
+        .collect()
+}
+
+/// The name of every existing entity that can have Own Variables.
+async fn entity_names(db: &mut impl toasty::Executor) -> Result<HashMap<Owner, String>, Error> {
+    let mut names = HashMap::new();
+    for host in models::Host::all().exec(&mut *db).await? {
+        names.insert(Owner::Host(host.id), host.name);
+    }
+    for group in all_groups(&mut *db).await? {
+        names.insert(Owner::Group(group.id), group.name);
+    }
+    for service in all_services(&mut *db).await? {
+        names.insert(Owner::Service(service.id), service.name);
+    }
+    let instances = models::ServiceInstance::all().exec(&mut *db).await?;
+    for instance in describe(&mut *db, instances).await? {
+        names.insert(Owner::ServiceInstance(instance.id), instance.label());
+    }
+    Ok(names)
+}
+
 /// An entity's Own Variable values, as `(variable id, value)`.
 async fn owner_values(
     db: &mut impl toasty::Executor,
@@ -375,15 +536,10 @@ async fn owner_values(
     let id = owner.id();
     let sql = format!("SELECT variable, value FROM {table} WHERE {column} = ?1");
     let rows = toasty::sql::query(&sql).bind(id).exec(db).await?;
-    rows.into_iter()
-        .map(|row| match row {
-            Value::Record(r) => match r.into_iter().collect::<Vec<_>>().as_slice() {
-                [Value::I64(variable), Value::String(value)] => Ok((*variable, value.clone())),
-                other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
-            },
-            other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
-        })
-        .collect()
+    decode_rows(&sql, rows, |row| match row {
+        [Value::I64(variable), Value::String(value)] => Some((*variable, value.clone())),
+        _ => None,
+    })
 }
 
 /// An entity's Own Variables for a delete preview, which must list every

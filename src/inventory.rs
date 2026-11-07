@@ -18,7 +18,9 @@ pub use groups::{Group, GroupDeletion, GroupTreeEntry};
 pub use hosts::{Host, HostDeletion, normalize_host_name};
 pub use service_instances::{ServiceInstance, ServiceInstanceDeletion};
 pub use services::{Service, ServiceDeletion, ServiceTreeEntry};
-pub use variables::{EffectiveVariable, OwnVariable, Owner, Source};
+pub use variables::{
+    EffectiveVariable, OwnVariable, Owner, OwnerKind, Source, Usage, VariableUsage,
+};
 
 use groups::*;
 use hierarchy::*;
