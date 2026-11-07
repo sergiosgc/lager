@@ -35,3 +35,30 @@ pub struct HostVariable {
 
     pub value: String,
 }
+
+/// A Group. `parent` is its Parent Group; the schema's foreign key on it
+/// points at a table that doesn't exist (ADR 0003).
+#[derive(Debug, toasty::Model)]
+#[table = "host_group"]
+pub struct Group {
+    #[key]
+    #[auto(increment)]
+    pub id: i64,
+
+    #[column("parent")]
+    pub parent_id: Option<i64>,
+
+    pub name: String,
+}
+
+/// A Host's direct membership of a Group.
+#[derive(Debug, toasty::Model)]
+#[table = "host_group_membership"]
+#[key(host_id, group_id)]
+pub struct Membership {
+    #[column("host")]
+    pub host_id: i64,
+
+    #[column("group")]
+    pub group_id: i64,
+}

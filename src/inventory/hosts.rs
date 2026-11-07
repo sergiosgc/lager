@@ -18,14 +18,19 @@ impl From<models::Host> for Host {
     }
 }
 
-/// What deleting a Host removes: the Host and its Own Variables. While
-/// `blockers` isn't empty, the Host can't be deleted.
+/// What deleting a Host removes: the Host, its Own Variables and its Group
+/// memberships. While `blockers` isn't empty, the Host can't be deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostDeletion {
     pub host: Host,
     pub own_variables: Vec<OwnVariable>,
-    /// Relations lager can't remove yet (Group memberships, Service
-    /// Instances), each as a sentence for the operator.
+    /// The Groups the Host stops being a member of (the Groups stay).
+    pub groups: Vec<Group>,
+    /// Memberships of Groups that no longer exist, left behind by `cli/si`;
+    /// the delete removes them too.
+    pub missing_memberships: usize,
+    /// Relations lager can't remove yet (Service Instances), each as a
+    /// sentence for the operator.
     pub blockers: Vec<String>,
 }
 
@@ -111,17 +116,12 @@ impl Inventory {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let plan = plan_host_deletion(&mut tx, host_id).await?;
-        if !plan.blockers.is_empty() {
-            return Err(invalid(
-                "host",
-                format!(
-                    "{} can't be deleted yet. {}",
-                    plan.host.name,
-                    plan.blockers.join(" ")
-                ),
-            ));
-        }
+        refuse_if_blocked("host", &plan.host.name, &plan.blockers)?;
         models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        models::Membership::filter(models::Membership::fields().host_id().eq(host_id))
             .delete()
             .exec(&mut tx)
             .await?;
@@ -198,28 +198,22 @@ pub(super) async fn plan_host_deletion(
         Unnamed::Label,
     )
     .await?;
-    // TEMPORARY until lager manages Group membership (#10) and Service
-    // Instances (#13): their tables aren't modelled yet, so they're counted
-    // with raw SQL and block the delete instead of cascading.
-    let groups = count_rows_for_host(
-        &mut *db,
-        "SELECT count(*) FROM host_group_membership WHERE host = ?1",
-        host_id,
-    )
-    .await?;
-    let instances = count_rows_for_host(
+    let groups = host_groups(&mut *db, host_id).await?;
+    let memberships =
+        models::Membership::filter(models::Membership::fields().host_id().eq(host_id))
+            .exec(&mut *db)
+            .await?
+            .len();
+    // TEMPORARY until lager manages Service Instances (#13): not modelled
+    // yet, so counted with raw SQL, and they block the delete instead of
+    // cascading.
+    let instances = count_rows(
         &mut *db,
         "SELECT count(*) FROM service_instance WHERE host = ?1",
         host_id,
     )
     .await?;
     let mut blockers = Vec::new();
-    if groups > 0 {
-        blockers.push(format!(
-            "It is a member of {}, and lager can't remove Hosts from Groups yet.",
-            plural(groups, "Group")
-        ));
-    }
     if instances > 0 {
         blockers.push(format!(
             "It has {}, and lager can't delete Service Instances yet.",
@@ -229,6 +223,8 @@ pub(super) async fn plan_host_deletion(
     Ok(HostDeletion {
         host: host.into(),
         own_variables,
+        missing_memberships: memberships - groups.len(),
+        groups,
         blockers,
     })
 }

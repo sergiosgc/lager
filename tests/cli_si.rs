@@ -117,3 +117,58 @@ async fn returns_the_host_variables_lager_set() {
     }
     assert!(web2_vars.get("gone").is_none(), "{web2_vars:#}");
 }
+
+#[tokio::test]
+async fn lists_the_groups_lager_wrote_with_hosts_and_children() {
+    if let Some(reason) = missing_python() {
+        eprintln!("SKIPPED lists_the_groups_lager_wrote_with_hosts_and_children: {reason}");
+        return;
+    }
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let all = inventory.create_group("all_sites").await.unwrap().value;
+    let eu = inventory.create_group("eu").await.unwrap().value;
+    let us = inventory.create_group("us").await.unwrap().value;
+    let gone = inventory.create_group("gone").await.unwrap().value;
+    inventory
+        .set_group_parent(eu.id, Some(all.id))
+        .await
+        .unwrap();
+    inventory
+        .set_group_parent(us.id, Some(all.id))
+        .await
+        .unwrap();
+    inventory
+        .set_group_parent(gone.id, Some(eu.id))
+        .await
+        .unwrap();
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
+    inventory.add_host_to_group(web1.id, eu.id).await.unwrap();
+    inventory
+        .set_host_groups(web2.id, &[eu.id, us.id])
+        .await
+        .unwrap();
+    inventory.add_host_to_group(web2.id, gone.id).await.unwrap();
+    inventory.delete_group(gone.id).await.unwrap();
+
+    let listing = run_si(&db.path, &["--list"]);
+
+    let group = |name: &str| (&listing[name]["hosts"], &listing[name]["children"]);
+    assert_eq!(
+        group("all_sites"),
+        (&serde_json::json!([]), &serde_json::json!(["eu", "us"])),
+        "{listing:#}"
+    );
+    assert_eq!(
+        group("eu"),
+        (&serde_json::json!(["web1", "web2"]), &serde_json::json!([])),
+        "{listing:#}"
+    );
+    assert_eq!(
+        group("us"),
+        (&serde_json::json!(["web2"]), &serde_json::json!([])),
+        "{listing:#}"
+    );
+    assert!(listing.get("gone").is_none(), "{listing:#}");
+}

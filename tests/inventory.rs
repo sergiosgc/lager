@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{open, temp_db};
+use common::{open, rows_referring_to, sql, temp_db};
 use lager::inventory::{Error, Inventory, OpenError, OwnVariable, SERVER_INDEX};
 
 #[tokio::test]
@@ -485,14 +485,6 @@ async fn server_index(inventory: &Inventory, host_id: i64) -> Option<String> {
         .map(|v| v.value)
 }
 
-/// Arranges data lager itself wouldn't write, the way cli/si or a deleted
-/// Host might have left it.
-fn sql(db: &common::TempDb, statement: &str) {
-    let conn = rusqlite::Connection::open(&db.path).unwrap();
-    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
-    conn.execute_batch(statement).unwrap();
-}
-
 #[tokio::test]
 async fn the_first_host_gets_server_index_1_and_the_next_2() {
     let db = temp_db();
@@ -713,18 +705,6 @@ async fn setting_a_duplicate_server_index_warns_naming_the_other_host() {
 
 // Renaming and deleting Hosts
 
-/// How many rows in `table` refer to the Host through `column`.
-fn rows_referring_to(db: &common::TempDb, table: &str, column: &str, host_id: i64) -> i64 {
-    rusqlite::Connection::open(&db.path)
-        .unwrap()
-        .query_row(
-            &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
-            [host_id],
-            |r| r.get(0),
-        )
-        .unwrap()
-}
-
 #[tokio::test]
 async fn renaming_a_host_keeps_its_identity_and_own_variables() {
     let db = temp_db();
@@ -865,7 +845,7 @@ async fn deleting_an_unknown_host_is_not_found() {
 }
 
 #[tokio::test]
-async fn a_host_in_groups_or_with_service_instances_cannot_be_deleted_yet() {
+async fn a_host_with_service_instances_cannot_be_deleted_yet() {
     let db = temp_db();
     let inventory = open(&db).await;
     let web1 = inventory.create_host("web1", None).await.unwrap().value;
@@ -873,9 +853,7 @@ async fn a_host_in_groups_or_with_service_instances_cannot_be_deleted_yet() {
     sql(
         &db,
         &format!(
-            "INSERT INTO host_group(id, name) VALUES (1, 'eu'), (2, 'web');
-             INSERT INTO host_group_membership(host, \"group\") VALUES ({id}, 1), ({id}, 2);
-             INSERT INTO service(id, name) VALUES (1, 'nginx');
+            "INSERT INTO service(id, name) VALUES (1, 'nginx');
              INSERT INTO service_instance(service, host, ip, name) VALUES (1, {id}, '192.0.2.10', 'main');",
             id = web1.id
         ),
@@ -886,10 +864,7 @@ async fn a_host_in_groups_or_with_service_instances_cannot_be_deleted_yet() {
 
     assert_eq!(
         preview.blockers,
-        [
-            "It is a member of 2 Groups, and lager can't remove Hosts from Groups yet.",
-            "It has 1 Service Instance, and lager can't delete Service Instances yet.",
-        ]
+        ["It has 1 Service Instance, and lager can't delete Service Instances yet."]
     );
     assert!(
         matches!(err, Error::Invalid { field: "host", .. }),

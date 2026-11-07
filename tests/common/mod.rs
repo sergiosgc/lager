@@ -49,3 +49,23 @@ pub fn temp_db() -> TempDb {
 pub async fn open(db: &TempDb) -> lager::inventory::Inventory {
     lager::inventory::Inventory::open(&db.path).await.unwrap()
 }
+
+/// Arranges data lager itself wouldn't write, the way cli/si or a deleted
+/// Host might have left it.
+pub fn sql(db: &TempDb, statement: &str) {
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute_batch(statement).unwrap();
+}
+
+/// How many rows in `table` refer to `id` through `column`.
+pub fn rows_referring_to(db: &TempDb, table: &str, column: &str, id: i64) -> i64 {
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}

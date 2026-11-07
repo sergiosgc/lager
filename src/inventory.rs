@@ -5,14 +5,17 @@
 //! either succeeds, possibly with warnings, or fails with an [`Error`] that
 //! says which field was wrong and why.
 
+mod groups;
 mod hosts;
 mod models;
 mod server_index;
 mod variables;
 
+pub use groups::{Group, GroupDeletion, GroupTreeEntry};
 pub use hosts::{Host, HostDeletion, normalize_host_name};
 pub use variables::OwnVariable;
 
+use groups::*;
 use hosts::*;
 use server_index::*;
 use variables::*;
@@ -147,6 +150,18 @@ impl Inventory {
     }
 }
 
+/// Refuses a delete while something blocks it, naming the entity (submitted
+/// as `field`) and every blocker.
+fn refuse_if_blocked(field: &'static str, name: &str, blockers: &[String]) -> Result<(), Error> {
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    Err(invalid(
+        field,
+        format!("{name} can't be deleted yet. {}", blockers.join(" ")),
+    ))
+}
+
 /// `"1 Group"`, `"2 Groups"`.
 fn plural(n: i64, noun: &str) -> String {
     if n == 1 {
@@ -156,16 +171,12 @@ fn plural(n: i64, noun: &str) -> String {
     }
 }
 
-/// Runs a raw `SELECT count(*) ... WHERE host = ?1` query for one Host.
+/// Runs a raw `SELECT count(*) ... = ?1` query for one entity.
 ///
 /// A result in any other shape is an error rather than 0: a wrong 0 would
 /// let a delete through and orphan rows (ADR 0002, ADR 0003).
-async fn count_rows_for_host(
-    db: &mut impl toasty::Executor,
-    sql: &str,
-    host_id: i64,
-) -> Result<i64, Error> {
-    let rows = toasty::sql::query(sql).bind(host_id).exec(db).await?;
+async fn count_rows(db: &mut impl toasty::Executor, sql: &str, id: i64) -> Result<i64, Error> {
+    let rows = toasty::sql::query(sql).bind(id).exec(db).await?;
     let mut rows = rows.into_iter();
     match (rows.next(), rows.next()) {
         (Some(Value::Record(r)), None) => match r.into_iter().collect::<Vec<_>>().as_slice() {
@@ -199,7 +210,9 @@ async fn open_without_foreign_keys(path: &Path) -> toasty::Result<toasty::Db> {
         .models(toasty::models!(
             models::Host,
             models::Variable,
-            models::HostVariable
+            models::HostVariable,
+            models::Group,
+            models::Membership
         ))
         .max_pool_size(1)
         .build(driver)

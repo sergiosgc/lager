@@ -15,6 +15,7 @@ use topcoat::{
     view::{View, view},
 };
 
+mod groups;
 mod hosts;
 
 use crate::inventory::{self, Inventory};
@@ -35,6 +36,20 @@ pub fn router(inventory: Inventory) -> Router {
         .page(hosts::rename_host)
         .page(hosts::delete_host_confirmation)
         .page(hosts::delete_host)
+        .page(hosts::add_host_group)
+        .page(hosts::remove_host_group)
+        .page(hosts::set_host_groups)
+        .page(groups::groups_list)
+        .page(groups::new_group_form)
+        .page(groups::create_group)
+        .page(groups::group_detail)
+        .page(groups::rename_group_form)
+        .page(groups::rename_group)
+        .page(groups::set_group_parent)
+        .page(groups::add_group_host)
+        .page(groups::remove_group_host)
+        .page(groups::delete_group_confirmation)
+        .page(groups::delete_group)
         .build()
 }
 
@@ -49,6 +64,10 @@ nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; 
 .warnings { background: #fff4ce; border-left: 4px solid #c88a00; padding: .5rem 1rem .5rem 2rem; }
 .actions { display: flex; gap: 1rem; }
 .danger { color: #fff; background: #b00020; border: 0; padding: .4rem .8rem; }
+.items li { display: flex; gap: .75rem; align-items: center; }
+.items form, form.inline { display: flex; gap: .5rem; align-items: center; margin: .5rem 0; }
+form.inline label { display: inline; margin: 0; }
+label.check { display: block; }
 .hint { color: #555; font-size: .9em; margin: .25rem 0; }
 label { display: block; margin-bottom: .25rem; }
 table { border-collapse: collapse; width: 100%; }
@@ -72,6 +91,7 @@ async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
                 <nav>
                     <strong>"Lager"</strong>
                     <a href=(href!(hosts::hosts_list))>"Hosts"</a>
+                    <a href=(href!(groups::groups_list))>"Groups"</a>
                 </nav>
                 <main>(slot)</main>
             </body>

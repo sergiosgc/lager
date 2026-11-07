@@ -14,8 +14,9 @@ use topcoat::{
     view::{View, component, view},
 };
 
+use super::groups::{GroupId, group_detail};
 use super::{FieldError, inventory, page_error};
-use crate::inventory::{Host, HostDeletion, OwnVariable};
+use crate::inventory::{Group, Host, HostDeletion, OwnVariable};
 
 #[page("/hosts")]
 pub(super) async fn hosts_list(cx: &Cx) -> Result<impl View> {
@@ -125,14 +126,35 @@ async fn new_host_view(
     })
 }
 
-topcoat::router::path_param!(host_id: i64, error = not_found);
+topcoat::router::path_param!(pub(super) host_id: i64, error = not_found);
 
 #[page("/hosts/{host_id}")]
 pub(super) async fn host_detail(cx: &Cx) -> Result<impl View> {
     let host = path_host(cx).await?;
-    let variables = inventory(cx).host_variables(host.id).await?;
-    let warnings = inventory(cx).host_warnings(host.id).await?;
-    Ok(view! { host_view(host: host, variables: variables, warnings: warnings, failed: None) })
+    let page = load_host_page(cx, host).await?;
+    Ok(view! { host_view(page: page, failed: None) })
+}
+
+/// Everything a Host's page shows.
+pub(super) struct HostPage {
+    host: Host,
+    variables: Vec<OwnVariable>,
+    warnings: Vec<String>,
+    /// The Groups the Host is directly in.
+    groups: Vec<Group>,
+    /// Every Group, for adding the Host to one or replacing its set.
+    all_groups: Vec<Group>,
+}
+
+async fn load_host_page(cx: &Cx, host: Host) -> Result<HostPage> {
+    let inventory = inventory(cx);
+    Ok(HostPage {
+        variables: inventory.host_variables(host.id).await?,
+        warnings: inventory.host_warnings(host.id).await?,
+        groups: inventory.host_groups(host.id).await?,
+        all_groups: inventory.groups().await?,
+        host,
+    })
 }
 
 /// The Host named by the `{host_id}` path parameter, or a 404.
@@ -177,16 +199,13 @@ pub(super) async fn set_host_variable(
     {
         Ok(_) => Err(see_other(host_variables_url(cx, host.id)).into()),
         Err(inventory::Error::Invalid { field, message }) => {
-            let variables = inventory(cx).host_variables(host.id).await?;
+            let page = load_host_page(cx, host).await?;
             let failed = FailedVariable {
                 input,
                 field,
                 message,
             };
-            let warnings = inventory(cx).host_warnings(host.id).await?;
-            Ok(view! {
-                host_view(host: host, variables: variables, warnings: warnings, failed: Some(failed))
-            })
+            Ok(view! { host_view(page: page, failed: Some(failed)) })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -211,23 +230,88 @@ pub(super) async fn remove_host_variable(
 }
 
 fn host_variables_url(cx: &Cx, host_id: i64) -> String {
+    host_url(cx, host_id, "variables")
+}
+
+fn host_url(cx: &Cx, host_id: i64, section: &str) -> String {
     format!(
-        "{}#variables",
+        "{}#{section}",
         href!(host_detail, HostId(host_id)).resolve(cx)
     )
+}
+
+#[derive(Deserialize)]
+pub(super) struct GroupChoice {
+    group: i64,
+}
+
+#[page(POST "/hosts/{host_id}/groups")]
+pub(super) async fn add_host_group(cx: &Cx, Form(input): Form<GroupChoice>) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    inventory(cx)
+        .add_host_to_group(host.id, input.group)
+        .await
+        .map_err(page_error)?;
+    Err::<(), _>(see_other(host_url(cx, host.id, "groups")).into())
+}
+
+#[page(POST "/hosts/{host_id}/groups/remove")]
+pub(super) async fn remove_host_group(
+    cx: &Cx,
+    Form(input): Form<GroupChoice>,
+) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    inventory(cx)
+        .remove_host_from_group(host.id, input.group)
+        .await
+        .map_err(page_error)?;
+    Err::<(), _>(see_other(host_url(cx, host.id, "groups")).into())
+}
+
+/// Replaces the Host's whole set of Groups with the checked ones. The form
+/// repeats the `group` key once per checked box, so the body is read as
+/// pairs.
+#[page(POST "/hosts/{host_id}/groups/set")]
+pub(super) async fn set_host_groups(
+    cx: &Cx,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    let mut group_ids = Vec::new();
+    for (key, value) in pairs {
+        if key == "group" {
+            group_ids.push(
+                value
+                    .parse::<i64>()
+                    .map_err(|_| topcoat::router::error::bad_request("group must be a Group id"))?,
+            );
+        }
+    }
+    inventory(cx)
+        .set_host_groups(host.id, &group_ids)
+        .await
+        .map_err(page_error)?;
+    Err::<(), _>(see_other(host_url(cx, host.id, "groups")).into())
 }
 
 /// A Host's page: its name and its Own Variables, each editable in place,
 /// plus a form to add one. A rejected submission is shown again in the form
 /// it came from, with its error.
 #[component]
-async fn host_view(
-    host: Host,
-    variables: Vec<OwnVariable>,
-    warnings: Vec<String>,
-    failed: Option<FailedVariable>,
-) -> Result<impl View> {
+async fn host_view(page: HostPage, failed: Option<FailedVariable>) -> Result<impl View> {
+    let HostPage {
+        host,
+        variables,
+        warnings,
+        groups,
+        all_groups,
+    } = page;
     let host_id = host.id;
+    let addable: Vec<Group> = all_groups
+        .iter()
+        .filter(|g| !groups.iter().any(|m| m.id == g.id))
+        .cloned()
+        .collect();
     let (edit_failure, add_failure) = match failed {
         // An edit whose row is gone (e.g. removed meanwhile) shows in the add
         // form instead, so its input isn't lost.
@@ -258,7 +342,7 @@ async fn host_view(
             (StatusCode::UNPROCESSABLE_ENTITY)
         }
         <p><a href=(href!(hosts_list))>"All Hosts"</a></p>
-        <h1>(host.name)</h1>
+        <h1>(host.name.clone())</h1>
         <p class="actions">
             <a href=(href!(rename_host_form, HostId(host_id)))>"Rename"</a>
             <a href=(href!(delete_host_confirmation, HostId(host_id)))>"Delete…"</a>
@@ -269,6 +353,60 @@ async fn host_view(
                     <li>(warning)</li>
                 }
             </ul>
+        }
+
+        <h2 id="groups">"Groups"</h2>
+        if groups.is_empty() {
+            <p>"This Host isn't directly in any Group."</p>
+        } else {
+            <ul class="items">
+                #[key(group.id)]
+                for group in groups.clone() {
+                    <li>
+                        <a href=(href!(group_detail, GroupId(group.id)))>(group.name.clone())</a>
+                        <form method="post" action=(href!(remove_host_group, HostId(host_id)))>
+                            <input type="hidden" name="group" value=(group.id)>
+                            <button type="submit"
+                                aria-label=(format!("Remove {} from {}", host.name, group.name))
+                            >"Remove"</button>
+                        </form>
+                    </li>
+                }
+            </ul>
+        }
+        if !addable.is_empty() {
+            <form method="post" action=(href!(add_host_group, HostId(host_id))) class="inline">
+                <label for="group">"Add to a Group"</label>
+                <select id="group" name="group">
+                    #[key(group.id)]
+                    for group in addable {
+                        <option value=(group.id)>(group.name)</option>
+                    }
+                </select>
+                <button type="submit">"Add"</button>
+            </form>
+        }
+        if !all_groups.is_empty() {
+            <details>
+                <summary>"Change all Groups at once"</summary>
+                <form method="post" action=(href!(set_host_groups, HostId(host_id)))>
+                    <fieldset>
+                        <legend>"Groups " (host.name.clone()) " is directly in"</legend>
+                        #[key(group.id)]
+                        for group in all_groups {
+                            <label class="check">
+                                <input type="checkbox" name="group" value=(group.id)
+                                    if groups.iter().any(|m| m.id == group.id) {
+                                        checked=(true)
+                                    }
+                                >
+                                (group.name)
+                            </label>
+                        }
+                    </fieldset>
+                    <p><button type="submit">"Save Groups"</button></p>
+                </form>
+            </details>
         }
 
         <h2 id="variables">"Own Variables"</h2>
@@ -474,6 +612,21 @@ async fn delete_host_view(deletion: HostDeletion, refused: bool) -> Result<impl 
                 </table>
             }
             <p class="hint">"Variable names stay, for anything else using them."</p>
+            <h2>"Groups it leaves"</h2>
+            if deletion.groups.is_empty() {
+                <p>"None: it isn't directly in any Group."</p>
+            } else {
+                <p class="hint">"The Groups themselves stay."</p>
+                <ul>
+                    #[key(group.id)]
+                    for group in deletion.groups {
+                        <li>(group.name)</li>
+                    }
+                </ul>
+            }
+            if deletion.missing_memberships > 0 {
+                <p>"Also removes " (deletion.missing_memberships) " membership(s) of Groups that no longer exist."</p>
+            }
             <form method="post" action=(href!(delete_host, HostId(host_id)))>
                 <p class="actions">
                     <button type="submit" class="danger">"Delete " (deletion.host.name)</button>

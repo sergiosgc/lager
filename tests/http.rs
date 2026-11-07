@@ -220,22 +220,157 @@ async fn deleting_a_host_goes_through_a_confirmation_listing_its_variables() {
 }
 
 #[tokio::test]
-async fn a_host_in_a_group_cannot_be_deleted_yet() {
+async fn a_host_with_a_service_instance_cannot_be_deleted_yet() {
     let (db, router) = app().await;
     let host = create_host(&router, "web1").await;
-    let conn = rusqlite::Connection::open(&db.path).unwrap();
-    conn.execute_batch(
-        "PRAGMA foreign_keys = OFF;
-         INSERT INTO host_group(id, name) VALUES (1, 'eu');
-         INSERT INTO host_group_membership(host, \"group\") SELECT id, 1 FROM host;",
-    )
-    .unwrap();
+    common::sql(
+        &db,
+        "INSERT INTO service(id, name) VALUES (1, 'nginx');
+         INSERT INTO service_instance(service, host, ip, name) SELECT 1, id, '192.0.2.10', 'main' FROM host;",
+    );
 
     let confirm = text(get(&router, &format!("{host}/delete")).await).await;
-    assert!(confirm.contains("member of 1 Group"), "{confirm}");
+    assert!(confirm.contains("1 Service Instance"), "{confirm}");
     assert!(!confirm.contains("<button"), "no delete button: {confirm}");
 
     let refused = post_form(&router, &format!("{host}/delete"), "").await;
     assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(get(&router, &host).await.status(), StatusCode::OK);
+}
+
+/// Creates a Group through the form and returns its page's path.
+async fn create_group(router: &Router, name: &str) -> String {
+    let created = post_form(router, "/groups/new", &format!("name={name}")).await;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    location(&created)
+}
+
+/// The id at the end of an entity page's path.
+fn id_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap()
+}
+
+#[tokio::test]
+async fn manages_groups_nesting_and_membership_from_both_sides() {
+    let (_db, router) = app().await;
+    let eu = create_group(&router, "eu").await;
+    let all = create_group(&router, "all_sites").await;
+    let host = create_host(&router, "web1").await;
+
+    // Nesting, and a cycle rejected with the loop named.
+    let nested = post_form(
+        &router,
+        &format!("{eu}/parent"),
+        &format!("parent={}", id_of(&all)),
+    )
+    .await;
+    assert_eq!(nested.status(), StatusCode::SEE_OTHER);
+    let cycle = post_form(
+        &router,
+        &format!("{all}/parent"),
+        &format!("parent={}", id_of(&eu)),
+    )
+    .await;
+    assert_eq!(cycle.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(cycle).await.contains("all_sites → eu → all_sites"));
+    let cleared = post_form(&router, &format!("{eu}/parent"), "parent=").await;
+    assert_eq!(cleared.status(), StatusCode::SEE_OTHER);
+    assert!(
+        text(get(&router, &eu).await)
+            .await
+            .contains("A top-level Group.")
+    );
+    post_form(
+        &router,
+        &format!("{eu}/parent"),
+        &format!("parent={}", id_of(&all)),
+    )
+    .await;
+    let list = text(get(&router, "/groups").await).await;
+    let (all_at, eu_at) = (
+        list.find(">all_sites<").unwrap(),
+        list.find(">eu<").unwrap(),
+    );
+    assert!(all_at < eu_at, "eu nested under all_sites: {list}");
+
+    // Add from the Group page, see it on the Host page.
+    let added = post_form(
+        &router,
+        &format!("{eu}/hosts"),
+        &format!("host={}", id_of(&host)),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::SEE_OTHER);
+    assert!(
+        text(get(&router, &host).await)
+            .await
+            .contains(&format!(r#"href="{eu}""#))
+    );
+
+    // Replace from the Host page, see it on both Group pages.
+    let replaced = post_form(
+        &router,
+        &format!("{host}/groups/set"),
+        &format!("group={}", id_of(&all)),
+    )
+    .await;
+    assert_eq!(replaced.status(), StatusCode::SEE_OTHER);
+    assert!(
+        text(get(&router, &all).await)
+            .await
+            .contains(&format!(r#"href="{host}""#))
+    );
+    assert!(
+        !text(get(&router, &eu).await)
+            .await
+            .contains(&format!(r#"href="{host}""#))
+    );
+
+    // Remove from the Host page.
+    let removed = post_form(
+        &router,
+        &format!("{host}/groups/remove"),
+        &format!("group={}", id_of(&all)),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+    assert!(
+        !text(get(&router, &all).await)
+            .await
+            .contains(&format!(r#"href="{host}""#))
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_group_goes_through_a_confirmation() {
+    let (_db, router) = app().await;
+    let eu = create_group(&router, "eu").await;
+    let all = create_group(&router, "all_sites").await;
+    let host = create_host(&router, "web1").await;
+    post_form(
+        &router,
+        &format!("{eu}/parent"),
+        &format!("parent={}", id_of(&all)),
+    )
+    .await;
+    post_form(
+        &router,
+        &format!("{all}/hosts"),
+        &format!("host={}", id_of(&host)),
+    )
+    .await;
+
+    let host_confirm = text(get(&router, &format!("{host}/delete")).await).await;
+    assert!(host_confirm.contains(">all_sites<"), "{host_confirm}");
+
+    let confirm = text(get(&router, &format!("{all}/delete")).await).await;
+    assert!(confirm.contains(">web1<"), "{confirm}");
+    assert!(confirm.contains(">eu<"), "{confirm}");
+
+    let deleted = post_form(&router, &format!("{all}/delete"), "").await;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&deleted), "/groups");
+    assert_eq!(get(&router, &all).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get(&router, &eu).await.status(), StatusCode::OK);
     assert_eq!(get(&router, &host).await.status(), StatusCode::OK);
 }
