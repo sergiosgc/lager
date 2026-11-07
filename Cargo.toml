@@ -1,0 +1,22 @@
+[package]
+name = "lager"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+description = "A local web interface for editing an Ansible inventory stored in SQLite"
+publish = false
+
+[dependencies]
+# Pinned exactly and upgraded only deliberately (ADR 0001).
+toasty = { version = "=0.11.0", features = ["sqlite"] }
+toasty-driver-sqlite = "=0.11.0"
+topcoat = "=0.11.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+tempfile = "3"
