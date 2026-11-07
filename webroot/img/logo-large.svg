@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 400 150"
+   width="400"
+   height="150"
+   version="1.1"
+   id="svg21"
+   sodipodi:docname="logo-large.svg"
+   inkscape:version="1.4 (e7c3feb100, 2024-10-09)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs21" />
+  <sodipodi:namedview
+     id="namedview21"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     showgrid="false"
+     showguides="true"
+     inkscape:zoom="1.6572815"
+     inkscape:cx="168.95138"
+     inkscape:cy="167.74458"
+     inkscape:window-width="3400"
+     inkscape:window-height="1403"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg21" />
+  <g
+     id="g22"
+     transform="matrix(0.71189295,0,0,0.71189295,-29.967695,-8.9272121)">
+    <path
+       id="rect14"
+       style="fill:#c1121f;stroke-width:1.36"
+       d="m 156.16,119.44 h 10.88 c 2.26032,0 4.08,1.81968 4.08,4.08 v 10.88 c 0,2.26032 -1.81968,4.08 -4.08,4.08 h -10.88 c -2.26032,0 -4.08,-1.81968 -4.08,-4.08 v -10.88 c 0,-2.26032 1.81968,-4.08 4.08,-4.08 z" />
+    <path
+       id="rect15"
+       style="fill:#d2545e;stroke-width:1.36"
+       d="m 157.52,119.44 h 8.16 v 6.8 h -8.16 z" />
+  </g>
+  <text
+     xml:space="preserve"
+     style="font-style:normal;font-variant:normal;font-weight:normal;font-stretch:normal;font-size:94.879px;line-height:1.3;font-family:'Source Code Pro';-inkscape-font-specification:'Source Code Pro, Normal';font-variant-ligatures:normal;font-variant-caps:normal;font-variant-numeric:normal;font-variant-east-asian:normal;text-align:start;writing-mode:lr-tb;direction:ltr;text-anchor:start;fill:#fdf0d5;fill-opacity:1;stroke-width:2.86551"
+     x="55.943237"
+     y="97.602341"
+     id="text22"><tspan
+       sodipodi:role="line"
+       id="tspan22"
+       x="55.943237"
+       y="97.602341"
+       style="stroke-width:2.86551">Lager</tspan></text>
+  <g
+     id="g23"
+     transform="matrix(0.71189295,0,0,0.71189295,-13.21506,-8.9272121)">
+    <path
+       id="path22"
+       style="fill:#c1121f;stroke-width:1.36"
+       d="m 156.16,119.44 h 10.88 c 2.26032,0 4.08,1.81968 4.08,4.08 v 10.88 c 0,2.26032 -1.81968,4.08 -4.08,4.08 h -10.88 c -2.26032,0 -4.08,-1.81968 -4.08,-4.08 v -10.88 c 0,-2.26032 1.81968,-4.08 4.08,-4.08 z" />
+    <path
+       id="path23"
+       style="fill:#d2545e;stroke-width:1.36"
+       d="m 157.52,119.44 h 8.16 v 6.8 h -8.16 z" />
+  </g>
+</svg>

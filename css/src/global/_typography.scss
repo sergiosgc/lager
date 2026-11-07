@@ -1,0 +1,14 @@
+@use "fontawesome/fontawesome.scss";
+@use "fontawesome/regular.scss";
+@use "fontawesome/solid.scss";
+@font-face {
+    font-family: "Source Sans 3";
+    src: url("../fonts/SourceSans3-VariableFont_wght.ttf") format("truetype");
+}
+
+html,
+body {
+    font-family: "Source Sans 3", sans-serif;
+    font-size: 20px;
+    color: var(--color-font);
+}

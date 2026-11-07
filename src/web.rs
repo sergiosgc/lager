@@ -34,6 +34,7 @@ pub fn router(inventory: Inventory, webroot: &Path) -> Router {
         // 404s.
         .serve_dir("/css/{*file}", webroot.join("css"))
         .serve_dir("/img/{*file}", webroot.join("img"))
+        .serve_dir("/fonts/{*file}", webroot.join("fonts"))
         .layout(root_layout)
         .route(home)
         .page(hosts::hosts_list)

@@ -1,0 +1,28 @@
+@use "sass:color";
+
+:root {
+  // --color-a: #432818;
+  // --color-b: #99582A;
+  // --color-c: #6F1D1B;
+  // --color-d: #AC9268;
+  // --color-e: #FFE6A7;
+  --color-a: #84828F;
+  --color-b: #F17300;
+  --color-c: #fdf0d5;
+  --color-d: #003049;
+  --color-e: #669bbc;
+  --color-white: #fef8ec;
+  --color-black: #130d01;
+  --color-lighter-gray: #c3c3c3;
+  --color-light-gray: #f6f6f6;
+  --color-medium-light-gray: #dfdfdf;
+  --color-medium-gray: #777777;
+  --color-dark-gray: #212121;
+
+  --color-content-background: hsl(from var(--color-d) h s 30);
+  --color-content-foreground: var(--color-white);
+  --color-nav-background: var(--color-d);
+  --color-nav-foreground: var(--color-white);
+  --color-page-background: hsl(from var(--color-d) h s 5);
+  --color-highlight: var(--color-c);
+}
