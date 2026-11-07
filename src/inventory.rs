@@ -15,6 +15,9 @@ use toasty::stmt::Value;
 /// The file opened when the database path given is a directory.
 pub const DATABASE_FILE_NAME: &str = "database.sqlite";
 
+/// The Variable holding a Host's Server Index.
+pub const SERVER_INDEX: &str = "server_index";
+
 /// The only `db_version` Lager knows how to read and write.
 pub const SUPPORTED_DB_VERSION: i64 = 1;
 
@@ -173,9 +176,19 @@ impl Inventory {
         Ok(host.map(Host::from))
     }
 
-    /// Creates a Host. Its name is normalised (see [`normalize_host_name`])
-    /// and must then be non-empty and not already used by another Host.
-    pub async fn create_host(&self, name: &str) -> Result<Done<Host>, Error> {
+    /// Creates a Host with its Server Index. Its name is normalised (see
+    /// [`normalize_host_name`]) and must then be non-empty and not already
+    /// used by another Host.
+    ///
+    /// Without `server_index`, or with a blank one, the Host gets
+    /// [`Inventory::next_server_index`].
+    /// An override must parse as JSON and is stored as given; if another
+    /// Host already has it, the Host is still created, with a warning.
+    pub async fn create_host(
+        &self,
+        name: &str,
+        server_index: Option<&str>,
+    ) -> Result<Done<Host>, Error> {
         let name = normalize_host_name(name);
         if name.is_empty() {
             return Err(invalid(
@@ -184,6 +197,10 @@ impl Inventory {
             ));
         }
         let name = name.as_str();
+        let server_index = server_index.filter(|v| !v.trim().is_empty());
+        if let Some(value) = server_index {
+            valid_json(SERVER_INDEX, value)?;
+        }
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let existing = models::Host::filter(models::Host::fields().name().eq(name))
@@ -197,8 +214,30 @@ impl Inventory {
             ));
         }
         let host = models::Host::create().name(name).exec(&mut tx).await?;
+        let index = match server_index {
+            Some(value) => value.to_string(),
+            None => next_server_index(&mut tx).await?.to_string(),
+        };
+        write_host_variable(&mut tx, host.id, SERVER_INDEX, &index).await?;
+        let warnings = host_warnings(&mut tx, host.id).await?;
         tx.commit().await?;
-        Ok(Done::ok(host.into()))
+        Ok(Done {
+            value: host.into(),
+            warnings,
+        })
+    }
+
+    /// The Server Index a new Host gets by default: one more than the
+    /// highest `server_index` among existing Hosts, counting only positive
+    /// JSON integers, or `1` when there is none. Gaps are never refilled.
+    pub async fn next_server_index(&self) -> Result<u64, Error> {
+        next_server_index(&mut self.db.clone()).await
+    }
+
+    /// Things about a Host the operator should notice, such as another Host
+    /// sharing its Server Index.
+    pub async fn host_warnings(&self, host_id: i64) -> Result<Vec<String>, Error> {
+        host_warnings(&mut self.db.clone(), host_id).await
     }
 
     /// A Host's Own Variables, sorted by name.
@@ -229,40 +268,20 @@ impl Inventory {
         value: &str,
     ) -> Result<Done<OwnVariable>, Error> {
         valid_variable_name(name)?;
-        valid_json(value)?;
+        valid_json("value", value)?;
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         existing_host(&mut tx, host_id).await?;
-        let variable_id = match variable_by_name(&mut tx, name).await? {
-            Some(variable) => variable.id,
-            None => {
-                models::Variable::create()
-                    .name(name)
-                    .exec(&mut tx)
-                    .await?
-                    .id
-            }
-        };
-        match host_variable(variable_id, host_id)
-            .first()
-            .exec(&mut tx)
-            .await?
-        {
-            Some(mut row) => row.update().value(value).exec(&mut tx).await?,
-            None => {
-                models::HostVariable::create()
-                    .variable_id(variable_id)
-                    .host_id(host_id)
-                    .value(value)
-                    .exec(&mut tx)
-                    .await?;
-            }
-        }
+        write_host_variable(&mut tx, host_id, name, value).await?;
+        let warnings = host_warnings(&mut tx, host_id).await?;
         tx.commit().await?;
-        Ok(Done::ok(OwnVariable {
-            name: name.to_string(),
-            value: value.to_string(),
-        }))
+        Ok(Done {
+            value: OwnVariable {
+                name: name.to_string(),
+                value: value.to_string(),
+            },
+            warnings,
+        })
     }
 
     /// Removes a Host's Own Variable. The Variable name stays, for any other
@@ -323,6 +342,99 @@ async fn own_variables(
     Ok(own)
 }
 
+/// Sets a Host's value of the Variable `name`, adding the name if it is new.
+/// The caller has checked the inputs and that the Host exists.
+async fn write_host_variable(
+    tx: &mut toasty::Transaction<'_>,
+    host_id: i64,
+    name: &str,
+    value: &str,
+) -> Result<(), Error> {
+    let variable_id = match variable_by_name(&mut *tx, name).await? {
+        Some(variable) => variable.id,
+        None => {
+            models::Variable::create()
+                .name(name)
+                .exec(&mut *tx)
+                .await?
+                .id
+        }
+    };
+    match host_variable(variable_id, host_id)
+        .first()
+        .exec(&mut *tx)
+        .await?
+    {
+        Some(mut row) => row.update().value(value).exec(&mut *tx).await?,
+        None => {
+            models::HostVariable::create()
+                .variable_id(variable_id)
+                .host_id(host_id)
+                .value(value)
+                .exec(&mut *tx)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The `server_index` value of every existing Host, as stored. Values left
+/// behind by deleted Hosts are not included.
+async fn server_indexes(db: &mut impl toasty::Executor) -> Result<Vec<(Host, String)>, Error> {
+    let Some(variable) = variable_by_name(&mut *db, SERVER_INDEX).await? else {
+        return Ok(Vec::new());
+    };
+    let hosts: std::collections::HashMap<i64, Host> = models::Host::all()
+        .exec(&mut *db)
+        .await?
+        .into_iter()
+        .map(|h| (h.id, Host::from(h)))
+        .collect();
+    let values =
+        models::HostVariable::filter(models::HostVariable::fields().variable_id().eq(variable.id))
+            .exec(&mut *db)
+            .await?;
+    Ok(values
+        .into_iter()
+        .filter_map(|v| hosts.get(&v.host_id).map(|h| (h.clone(), v.value)))
+        .collect())
+}
+
+async fn next_server_index(db: &mut impl toasty::Executor) -> Result<u64, Error> {
+    let highest = server_indexes(db)
+        .await?
+        .iter()
+        .filter_map(|(_, value)| parse_json(value)?.as_u64())
+        .filter(|&n| n > 0)
+        .max();
+    // Saturating: an absurdly large stored value must not block new Hosts.
+    Ok(highest.map_or(1, |n| n.saturating_add(1)))
+}
+
+async fn host_warnings(db: &mut impl toasty::Executor, host_id: i64) -> Result<Vec<String>, Error> {
+    let indexes = server_indexes(db).await?;
+    let Some((_, own)) = indexes.iter().find(|(h, _)| h.id == host_id) else {
+        return Ok(Vec::new());
+    };
+    let Some(own_json) = parse_json(own) else {
+        return Ok(Vec::new());
+    };
+    let mut others: Vec<&str> = indexes
+        .iter()
+        .filter(|(h, value)| h.id != host_id && parse_json(value).as_ref() == Some(&own_json))
+        .map(|(h, _)| h.name.as_str())
+        .collect();
+    if others.is_empty() {
+        return Ok(Vec::new());
+    }
+    others.sort();
+    Ok(vec![format!(
+        "Server Index {} is also used by {}.",
+        own.trim(),
+        others.join(", ")
+    )])
+}
+
 /// Fails with [`Error::NotFound`] unless the Host exists.
 async fn existing_host(tx: &mut toasty::Transaction<'_>, host_id: i64) -> Result<(), Error> {
     match models::Host::filter_by_id(host_id).first().exec(tx).await? {
@@ -333,13 +445,13 @@ async fn existing_host(tx: &mut toasty::Transaction<'_>, host_id: i64) -> Result
 
 /// The Variable called exactly `name`, if there is one.
 async fn variable_by_name(
-    tx: &mut toasty::Transaction<'_>,
+    db: &mut impl toasty::Executor,
     name: &str,
 ) -> Result<Option<models::Variable>, Error> {
     Ok(
         models::Variable::filter(models::Variable::fields().name().eq(name))
             .first()
-            .exec(tx)
+            .exec(db)
             .await?,
     )
 }
@@ -365,11 +477,16 @@ fn valid_variable_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Checks that a Variable value is a JSON document.
-fn valid_json(value: &str) -> Result<(), Error> {
+/// The JSON document in a stored Variable value, if it is one.
+fn parse_json(value: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(value).ok()
+}
+
+/// Checks that a Variable value, submitted as `field`, is a JSON document.
+fn valid_json(field: &'static str, value: &str) -> Result<(), Error> {
     serde_json::from_str::<serde_json::Value>(value)
         .map(|_| ())
-        .map_err(|e| invalid("value", format!("This is not valid JSON: {e}.")))
+        .map_err(|e| invalid(field, format!("This is not valid JSON: {e}.")))
 }
 
 /// The name a Host is stored under: lowercased, keeping only `a`-`z`,

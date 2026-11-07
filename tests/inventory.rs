@@ -3,7 +3,7 @@
 mod common;
 
 use common::{open, temp_db};
-use lager::inventory::{Error, Inventory, OpenError, OwnVariable};
+use lager::inventory::{Error, Inventory, OpenError, OwnVariable, SERVER_INDEX};
 
 #[tokio::test]
 async fn refuses_a_missing_database_file() {
@@ -23,7 +23,7 @@ async fn refuses_a_missing_database_file() {
 #[tokio::test]
 async fn opens_database_sqlite_inside_a_given_directory() {
     let db = temp_db();
-    open(&db).await.create_host("web1").await.unwrap();
+    open(&db).await.create_host("web1", None).await.unwrap();
 
     let inventory = Inventory::open(db.dir.path()).await.unwrap();
 
@@ -73,7 +73,7 @@ async fn creates_a_host_and_gets_it_back() {
     let db = temp_db();
     let inventory = open(&db).await;
 
-    let done = inventory.create_host("web1").await.unwrap();
+    let done = inventory.create_host("web1", None).await.unwrap();
     assert!(done.warnings.is_empty());
     let created = done.value;
     assert_eq!(created.name, "web1");
@@ -97,7 +97,7 @@ async fn lists_hosts_sorted_by_name() {
     let db = temp_db();
     let inventory = open(&db).await;
     for name in ["web2", "db1", "web10", "app1"] {
-        inventory.create_host(name).await.unwrap();
+        inventory.create_host(name, None).await.unwrap();
     }
 
     let names: Vec<String> = inventory
@@ -117,7 +117,7 @@ async fn rejects_an_empty_host_name() {
     let inventory = open(&db).await;
 
     for name in ["", "   ", "!!!", "ÉÉ."] {
-        let err = inventory.create_host(name).await.unwrap_err();
+        let err = inventory.create_host(name, None).await.unwrap_err();
         assert!(
             matches!(err, Error::Invalid { field: "name", ref message } if message.contains("empty")),
             "{name:?}: {err:?}"
@@ -130,9 +130,9 @@ async fn rejects_an_empty_host_name() {
 async fn rejects_a_duplicate_host_name() {
     let db = temp_db();
     let inventory = open(&db).await;
-    inventory.create_host("web1").await.unwrap();
+    inventory.create_host("web1", None).await.unwrap();
 
-    let err = inventory.create_host("web1").await.unwrap_err();
+    let err = inventory.create_host("web1", None).await.unwrap_err();
 
     assert!(
         matches!(err, Error::Invalid { field: "name", ref message } if message.contains("web1")),
@@ -152,7 +152,7 @@ async fn normalizes_host_names_to_lowercase_letters_digits_dashes_and_underscore
         ("mail server #2", "mailserver2"),
         ("Ça-va", "a-va"),
     ] {
-        let host = inventory.create_host(given).await.unwrap().value;
+        let host = inventory.create_host(given, None).await.unwrap().value;
         assert_eq!(host.name, stored, "{given:?}");
     }
 }
@@ -161,10 +161,10 @@ async fn normalizes_host_names_to_lowercase_letters_digits_dashes_and_underscore
 async fn rejects_a_name_that_normalizes_to_an_existing_host() {
     let db = temp_db();
     let inventory = open(&db).await;
-    inventory.create_host("web1").await.unwrap();
+    inventory.create_host("web1", None).await.unwrap();
 
     for name in ["WEB1", " web1 ", "web.1"] {
-        let err = inventory.create_host(name).await.unwrap_err();
+        let err = inventory.create_host(name, None).await.unwrap_err();
         assert!(
             matches!(err, Error::Invalid { field: "name", ref message } if message.contains("web1")),
             "{name:?}: {err:?}"
@@ -174,6 +174,14 @@ async fn rejects_a_name_that_normalizes_to_an_existing_host() {
 }
 
 // Host Own Variables
+
+/// A Host's Own Variables, leaving out the `server_index` every new Host
+/// gets, which the Server Index tests cover.
+async fn variables_besides_server_index(inventory: &Inventory, host_id: i64) -> Vec<OwnVariable> {
+    let mut variables = inventory.host_variables(host_id).await.unwrap();
+    variables.retain(|v| v.name != SERVER_INDEX);
+    variables
+}
 
 fn own(name: &str, value: &str) -> OwnVariable {
     OwnVariable {
@@ -186,7 +194,7 @@ fn own(name: &str, value: &str) -> OwnVariable {
 async fn sets_host_own_variables_listed_by_name() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
 
     inventory
         .set_host_variable(web1.id, "ntp_server", r#""ntp.example.org""#)
@@ -198,7 +206,7 @@ async fn sets_host_own_variables_listed_by_name() {
         .unwrap();
 
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [
             own("dns", r#"["192.0.2.53", "192.0.2.54"]"#),
             own("ntp_server", r#""ntp.example.org""#),
@@ -210,7 +218,7 @@ async fn sets_host_own_variables_listed_by_name() {
 async fn stores_the_json_text_exactly_as_submitted() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
     let value = "{ \"b\": 1,\n  \"a\": [1.50, true] }";
 
     inventory
@@ -219,7 +227,7 @@ async fn stores_the_json_text_exactly_as_submitted() {
         .unwrap();
 
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own("cfg", value)]
     );
 }
@@ -228,7 +236,7 @@ async fn stores_the_json_text_exactly_as_submitted() {
 async fn overwrites_an_own_variable() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
         .set_host_variable(web1.id, "port", "80")
         .await
@@ -240,7 +248,7 @@ async fn overwrites_an_own_variable() {
         .unwrap();
 
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own("port", "8080")]
     );
 }
@@ -249,8 +257,8 @@ async fn overwrites_an_own_variable() {
 async fn own_variables_belong_to_their_host() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
-    let web2 = inventory.create_host("web2").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
 
     inventory
         .set_host_variable(web1.id, "port", "80")
@@ -262,11 +270,11 @@ async fn own_variables_belong_to_their_host() {
         .unwrap();
 
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own("port", "80")]
     );
     assert_eq!(
-        inventory.host_variables(web2.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web2.id).await,
         [own("port", "81")]
     );
 }
@@ -275,8 +283,8 @@ async fn own_variables_belong_to_their_host() {
 async fn removing_an_own_variable_leaves_it_on_other_hosts() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
-    let web2 = inventory.create_host("web2").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
     inventory
         .set_host_variable(web1.id, "port", "80")
         .await
@@ -291,9 +299,13 @@ async fn removing_an_own_variable_leaves_it_on_other_hosts() {
         .await
         .unwrap();
 
-    assert!(inventory.host_variables(web1.id).await.unwrap().is_empty());
+    assert!(
+        variables_besides_server_index(&inventory, web1.id)
+            .await
+            .is_empty()
+    );
     assert_eq!(
-        inventory.host_variables(web2.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web2.id).await,
         [own("port", "81")]
     );
 }
@@ -302,7 +314,7 @@ async fn removing_an_own_variable_leaves_it_on_other_hosts() {
 async fn removing_the_last_value_keeps_the_variable_name() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
         .set_host_variable(web1.id, "port", "80")
         .await
@@ -313,15 +325,18 @@ async fn removing_the_last_value_keeps_the_variable_name() {
         .await
         .unwrap();
 
-    assert_eq!(inventory.variable_names().await.unwrap(), ["port"]);
+    assert_eq!(
+        inventory.variable_names().await.unwrap(),
+        ["port", "server_index"]
+    );
 }
 
 #[tokio::test]
 async fn setting_a_variable_reuses_its_name() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
-    let web2 = inventory.create_host("web2").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
 
     inventory
         .set_host_variable(web1.id, "port", "80")
@@ -340,14 +355,17 @@ async fn setting_a_variable_reuses_its_name() {
         .await
         .unwrap();
 
-    assert_eq!(inventory.variable_names().await.unwrap(), ["port"]);
+    assert_eq!(
+        inventory.variable_names().await.unwrap(),
+        ["port", "server_index"]
+    );
 }
 
 #[tokio::test]
 async fn rejects_a_value_that_is_not_json() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
     inventory
         .set_host_variable(web1.id, "port", "80")
         .await
@@ -364,7 +382,7 @@ async fn rejects_a_value_that_is_not_json() {
         );
     }
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own("port", "80")]
     );
 }
@@ -373,7 +391,7 @@ async fn rejects_a_value_that_is_not_json() {
 async fn rejects_an_empty_variable_name() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
 
     for name in ["", "  "] {
         let err = inventory
@@ -385,15 +403,19 @@ async fn rejects_an_empty_variable_name() {
             "{name:?}: {err:?}"
         );
     }
-    assert!(inventory.host_variables(web1.id).await.unwrap().is_empty());
-    assert!(inventory.variable_names().await.unwrap().is_empty());
+    assert!(
+        variables_besides_server_index(&inventory, web1.id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(inventory.variable_names().await.unwrap(), ["server_index"]);
 }
 
 #[tokio::test]
 async fn keeps_variable_names_exactly_as_given() {
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
     // As cli/si may have written it: a name with surrounding whitespace.
     inventory
         .set_host_variable(web1.id, " port", "80")
@@ -409,7 +431,7 @@ async fn keeps_variable_names_exactly_as_given() {
         .await
         .unwrap();
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own(" port", "8080"), own("port", "81")]
     );
 
@@ -418,7 +440,7 @@ async fn keeps_variable_names_exactly_as_given() {
         .await
         .unwrap();
     assert_eq!(
-        inventory.host_variables(web1.id).await.unwrap(),
+        variables_besides_server_index(&inventory, web1.id).await,
         [own("port", "81")]
     );
 }
@@ -448,4 +470,243 @@ async fn removing_a_variable_of_an_unknown_host_is_not_found() {
         .unwrap_err();
 
     assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+// Server Index
+
+/// The Host's `server_index` Own Variable, as stored.
+async fn server_index(inventory: &Inventory, host_id: i64) -> Option<String> {
+    inventory
+        .host_variables(host_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|v| v.name == SERVER_INDEX)
+        .map(|v| v.value)
+}
+
+/// Arranges data lager itself wouldn't write, the way cli/si or a deleted
+/// Host might have left it.
+fn sql(db: &common::TempDb, statement: &str) {
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute_batch(statement).unwrap();
+}
+
+#[tokio::test]
+async fn the_first_host_gets_server_index_1_and_the_next_2() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    assert_eq!(inventory.next_server_index().await.unwrap(), 1);
+
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
+
+    assert_eq!(
+        server_index(&inventory, web1.id).await.as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        server_index(&inventory, web2.id).await.as_deref(),
+        Some("2")
+    );
+    assert_eq!(inventory.next_server_index().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn ignores_server_indexes_that_are_not_positive_json_integers() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let mut hosts = Vec::new();
+    for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        hosts.push(inventory.create_host(name, None).await.unwrap().value);
+    }
+    for (host, value) in hosts
+        .iter()
+        .zip(["7", "0", "-40", "12.5", "\"99\"", "null", "[100]", "1e3"])
+    {
+        inventory
+            .set_host_variable(host.id, SERVER_INDEX, value)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(inventory.next_server_index().await.unwrap(), 8);
+}
+
+#[tokio::test]
+async fn saves_an_override_as_given() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory.create_host("web1", None).await.unwrap();
+
+    let web2 = inventory.create_host("web2", Some("40")).await.unwrap();
+    let web3 = inventory
+        .create_host("web3", Some(r#""spare""#))
+        .await
+        .unwrap();
+
+    assert!(web2.warnings.is_empty(), "{:?}", web2.warnings);
+    assert_eq!(
+        server_index(&inventory, web2.value.id).await.as_deref(),
+        Some("40")
+    );
+    assert_eq!(
+        server_index(&inventory, web3.value.id).await.as_deref(),
+        Some(r#""spare""#)
+    );
+    assert_eq!(inventory.next_server_index().await.unwrap(), 41);
+}
+
+#[tokio::test]
+async fn rejects_an_override_that_is_not_json() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+
+    let err = inventory
+        .create_host("web1", Some("abc"))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, Error::Invalid { field: "server_index", ref message } if message.contains("JSON")),
+        "{err:?}"
+    );
+    assert!(
+        inventory.hosts().await.unwrap().is_empty(),
+        "no half-created Host"
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_override_warns_naming_the_other_host_and_still_creates() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+
+    let done = inventory.create_host("web2", Some("1")).await.unwrap();
+
+    assert_eq!(
+        server_index(&inventory, done.value.id).await.as_deref(),
+        Some("1")
+    );
+    assert_eq!(done.warnings, ["Server Index 1 is also used by web1."]);
+    assert_eq!(
+        inventory.host_warnings(web1.id).await.unwrap(),
+        ["Server Index 1 is also used by web2."]
+    );
+}
+
+#[tokio::test]
+async fn names_every_other_host_sharing_the_server_index() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory.create_host("web2", Some("5")).await.unwrap();
+    inventory.create_host("web1", Some("5")).await.unwrap();
+
+    let done = inventory.create_host("web3", Some("5")).await.unwrap();
+
+    assert_eq!(
+        done.warnings,
+        ["Server Index 5 is also used by web1, web2."]
+    );
+}
+
+#[tokio::test]
+async fn never_refills_a_gap() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    for name in ["web1", "web2", "web3"] {
+        inventory.create_host(name, None).await.unwrap();
+    }
+    // Deleting a Host (as cli/si does) leaves a gap at 2.
+    sql(
+        &db,
+        "DELETE FROM host_variable WHERE host = (SELECT id FROM host WHERE name = 'web2');
+              DELETE FROM host WHERE name = 'web2';",
+    );
+
+    let web4 = inventory.create_host("web4", None).await.unwrap().value;
+
+    assert_eq!(
+        server_index(&inventory, web4.id).await.as_deref(),
+        Some("4")
+    );
+}
+
+#[tokio::test]
+async fn the_highest_index_comes_back_only_while_it_is_one_past_the_max() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    for name in ["web1", "web2", "web3"] {
+        inventory.create_host(name, None).await.unwrap();
+    }
+    sql(
+        &db,
+        "DELETE FROM host_variable WHERE host = (SELECT id FROM host WHERE name = 'web3');
+              DELETE FROM host WHERE name = 'web3';",
+    );
+
+    assert_eq!(inventory.next_server_index().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn ignores_server_indexes_of_deleted_hosts_left_behind() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory.create_host("web1", None).await.unwrap();
+    inventory.create_host("web2", None).await.unwrap();
+    // cli/si's host delete leaves the Host's Variables behind (ADR 0003).
+    sql(&db, "DELETE FROM host WHERE name = 'web2';");
+
+    assert_eq!(inventory.next_server_index().await.unwrap(), 2);
+    let web3 = inventory.create_host("web3", Some("2")).await.unwrap();
+    assert!(web3.warnings.is_empty(), "{:?}", web3.warnings);
+}
+
+#[tokio::test]
+async fn a_blank_override_assigns_the_next_server_index() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory.create_host("web1", None).await.unwrap();
+
+    let web2 = inventory
+        .create_host("web2", Some("  "))
+        .await
+        .unwrap()
+        .value;
+
+    assert_eq!(
+        server_index(&inventory, web2.id).await.as_deref(),
+        Some("2")
+    );
+}
+
+#[tokio::test]
+async fn the_largest_possible_server_index_does_not_block_new_hosts() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory
+        .create_host("web1", Some("18446744073709551615"))
+        .await
+        .unwrap();
+
+    let web2 = inventory.create_host("web2", None).await;
+
+    assert!(web2.is_ok(), "{web2:?}");
+}
+
+#[tokio::test]
+async fn setting_a_duplicate_server_index_warns_naming_the_other_host() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    inventory.create_host("web1", None).await.unwrap();
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
+
+    let done = inventory
+        .set_host_variable(web2.id, SERVER_INDEX, "1")
+        .await
+        .unwrap();
+
+    assert_eq!(done.warnings, ["Server Index 1 is also used by web1."]);
 }

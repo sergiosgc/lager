@@ -112,7 +112,7 @@ async fn sets_edits_and_removes_a_host_variable_from_its_page() {
     let removed = post_form(&router, &format!("{variables}/remove"), "name=port").await;
     assert_eq!(removed.status(), StatusCode::SEE_OTHER);
     let page = text(get(&router, &host).await).await;
-    assert!(page.contains("This Host has no Own Variables."), "{page}");
+    assert!(!page.contains(r#"<th scope="row">port</th>"#), "{page}");
 }
 
 #[tokio::test]
@@ -146,4 +146,22 @@ async fn invalid_json_re_renders_the_host_page_with_the_error_and_input() {
     assert!(page.contains("A Variable name can"), "{page}");
     assert!(page.contains(r#"value=" ""#), "{page}");
     assert!(page.contains(">\"x\"</textarea>"), "{page}");
+}
+
+#[tokio::test]
+async fn suggests_the_next_server_index_and_warns_about_a_duplicate_after_saving() {
+    let (_db, router) = app().await;
+    create_host(&router, "web1").await;
+
+    let form = text(get(&router, "/hosts/new").await).await;
+    assert!(form.contains(r#"name="server_index""#), "{form}");
+    assert!(form.contains(r#"value="2""#), "{form}");
+
+    let created = post_form(&router, "/hosts/new", "name=web2&server_index=1").await;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    let page = text(get(&router, &location(&created)).await).await;
+    assert!(
+        page.contains("Server Index 1 is also used by web1."),
+        "{page}"
+    );
 }

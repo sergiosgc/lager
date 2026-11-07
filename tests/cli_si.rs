@@ -51,7 +51,7 @@ async fn lists_a_host_lager_created() {
         return;
     }
     let db = temp_db();
-    open(&db).await.create_host("web1").await.unwrap();
+    open(&db).await.create_host("web1", None).await.unwrap();
 
     let listing = run_si(&db.path, &["--list"]);
 
@@ -69,8 +69,8 @@ async fn returns_the_host_variables_lager_set() {
     }
     let db = temp_db();
     let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1").await.unwrap().value;
-    let web2 = inventory.create_host("web2").await.unwrap().value;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
     for (name, value) in [
         ("ntp_server", r#""ntp.example.org""#),
         ("port", "8080"),
@@ -98,7 +98,13 @@ async fn returns_the_host_variables_lager_set() {
     let web1_vars = run_si(&db.path, &["--host", "web1"]);
     let web2_vars = run_si(&db.path, &["--host", "web2"]);
 
+    assert_eq!(
+        web2_vars["server_index"],
+        serde_json::json!(2),
+        "{web2_vars:#}"
+    );
     for (name, expected) in [
+        ("server_index", serde_json::json!(1)),
         ("ntp_server", serde_json::json!("ntp.example.org")),
         ("port", serde_json::json!(8443)),
         ("dns", serde_json::json!(["192.0.2.53", "192.0.2.54"])),

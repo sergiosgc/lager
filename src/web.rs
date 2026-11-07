@@ -42,6 +42,7 @@ const STYLE: &str = "
 body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 0 auto; padding: 0 1rem; }
 nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; }
 .error { color: #b00020; }
+.warnings { background: #fff4ce; border-left: 4px solid #c88a00; padding: .5rem 1rem .5rem 2rem; }
 .hint { color: #555; font-size: .9em; margin: .25rem 0; }
 label { display: block; margin-bottom: .25rem; }
 table { border-collapse: collapse; width: 100%; }
@@ -98,28 +99,58 @@ async fn hosts_list(cx: &Cx) -> Result<impl View> {
 #[derive(Deserialize)]
 struct NewHost {
     name: String,
+    /// Blank or missing means "assign the next Server Index automatically".
+    #[serde(default)]
+    server_index: String,
+}
+
+/// A rejected input: which field it was and why.
+struct FieldError {
+    field: &'static str,
+    message: String,
 }
 
 #[page("/hosts/new")]
-async fn new_host_form() -> Result<impl View> {
-    Ok(view! { new_host_view(name: String::new(), error: None) })
+async fn new_host_form(cx: &Cx) -> Result<impl View> {
+    let suggested = inventory(cx).next_server_index().await?;
+    Ok(
+        view! { new_host_view(name: String::new(), server_index: suggested.to_string(), error: None) },
+    )
 }
 
 #[page(POST "/hosts/new")]
 async fn create_host(cx: &Cx, Form(input): Form<NewHost>) -> Result<impl View> {
-    match inventory(cx).create_host(&input.name).await {
+    match inventory(cx)
+        .create_host(&input.name, Some(&input.server_index))
+        .await
+    {
         Ok(done) => Err(see_other(href!(host_detail, HostId(done.value.id)).resolve(cx)).into()),
-        Err(inventory::Error::Invalid { message, .. }) => {
-            Ok(view! { new_host_view(name: input.name, error: Some(message)) })
-        }
+        Err(inventory::Error::Invalid { field, message }) => Ok(view! {
+            new_host_view(
+                name: input.name,
+                server_index: input.server_index,
+                error: Some(FieldError { field, message }),
+            )
+        }),
         Err(e) => Err(page_error(e)),
     }
 }
 
-/// The new-Host form, showing `name` as typed and the error it was rejected
-/// with, if any.
+/// The new-Host form, showing the input as typed and the error it was
+/// rejected with, if any.
 #[component]
-async fn new_host_view(name: String, error: Option<String>) -> Result<impl View> {
+async fn new_host_view(
+    name: String,
+    server_index: String,
+    error: Option<FieldError>,
+) -> Result<impl View> {
+    let field_error = |field: &str| {
+        error
+            .as_ref()
+            .filter(|e| e.field == field)
+            .map(|e| e.message.clone())
+    };
+    let (name_error, index_error) = (field_error("name"), field_error(inventory::SERVER_INDEX));
     Ok(view! {
         if error.is_some() {
             (StatusCode::UNPROCESSABLE_ENTITY)
@@ -128,7 +159,7 @@ async fn new_host_view(name: String, error: Option<String>) -> Result<impl View>
         <form method="post" action=(href!(create_host))>
             <label for="name">"Name"</label>
             <input id="name" name="name" value=(name) required=(true) autofocus=(true)
-                if error.is_some() {
+                if name_error.is_some() {
                     aria-invalid="true"
                     aria-describedby="name-hint name-error"
                 } else {
@@ -138,8 +169,23 @@ async fn new_host_view(name: String, error: Option<String>) -> Result<impl View>
             <p id="name-hint" class="hint">
                 "Saved in lowercase, keeping only letters a–z, digits, \"-\" and \"_\"."
             </p>
-            if let Some(error) = error {
+            if let Some(error) = name_error {
                 <p id="name-error" class="error">(error)</p>
+            }
+            <label for="server_index">"Server Index"</label>
+            <input id="server_index" name="server_index" value=(server_index)
+                if index_error.is_some() {
+                    aria-invalid="true"
+                    aria-describedby="server_index-hint server_index-error"
+                } else {
+                    aria-describedby="server_index-hint"
+                }
+            >
+            <p id="server_index-hint" class="hint">
+                "Suggested: one more than the highest Server Index in use. Any JSON value is accepted; leave blank to use the next number."
+            </p>
+            if let Some(error) = index_error {
+                <p id="server_index-error" class="error">(error)</p>
             }
             <p><button type="submit">"Create Host"</button></p>
         </form>
@@ -152,7 +198,8 @@ topcoat::router::path_param!(host_id: i64, error = not_found);
 async fn host_detail(cx: &Cx) -> Result<impl View> {
     let host = path_host(cx).await?;
     let variables = inventory(cx).host_variables(host.id).await?;
-    Ok(view! { host_view(host: host, variables: variables, failed: None) })
+    let warnings = inventory(cx).host_warnings(host.id).await?;
+    Ok(view! { host_view(host: host, variables: variables, warnings: warnings, failed: None) })
 }
 
 /// The Host named by the `{host_id}` path parameter, or a 404.
@@ -209,7 +256,10 @@ async fn set_host_variable(cx: &Cx, Form(input): Form<VariableInput>) -> Result<
                 field,
                 message,
             };
-            Ok(view! { host_view(host: host, variables: variables, failed: Some(failed)) })
+            let warnings = inventory(cx).host_warnings(host.id).await?;
+            Ok(view! {
+                host_view(host: host, variables: variables, warnings: warnings, failed: Some(failed))
+            })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -244,6 +294,7 @@ fn host_variables_url(cx: &Cx, host_id: i64) -> String {
 async fn host_view(
     host: Host,
     variables: Vec<OwnVariable>,
+    warnings: Vec<String>,
     failed: Option<FailedVariable>,
 ) -> Result<impl View> {
     let host_id = host.id;
@@ -278,6 +329,13 @@ async fn host_view(
         }
         <p><a href=(href!(hosts_list))>"All Hosts"</a></p>
         <h1>(host.name)</h1>
+        if !warnings.is_empty() {
+            <ul class="warnings" role="status">
+                for warning in warnings {
+                    <li>(warning)</li>
+                }
+            </ul>
+        }
 
         <h2 id="variables">"Own Variables"</h2>
         if variables.is_empty() {
