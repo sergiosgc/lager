@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+from optparse import OptionParser
+import sys
+import sqlite3
+import os
+import json
+import yaml
+
+def usage():
+    sys.stderr.write('''Usage:
+  Ansible API usage:
+    sqlite --list 
+    Lists all groups, hosts, group variables and host variables in the API-defined JSON structure
+
+    sqlite --host <hostname>
+    List host vars in the API-defined JSON structure
+
+  Inventory manipulation usage:
+    Host manipulation:
+      sqlite host <add|delete> <host_name>
+      sqlite host list
+      sqlite host set_variable <host_name> <var_name> <json_var_value>
+      sqlite host get_variables <host_name>
+      sqlite host set_groups <host_name> <comma_separated_group_list>
+      sqlite host add_group <host_name> <group_name>
+      sqlite host remove_group <host_name> <group_name>
+      sqlite host get_groups <host_name>
+
+    Host group manipulation:
+      sqlite host_group <add|delete> <host_group_name>
+      sqlite host_group list
+      sqlite host_group get_hosts <host_group_name>
+      sqlite host_group set_parent <host_group_name> [parent]
+      sqlite host_group set_variable <host_group_name> <var_name> <json_var_value>
+      sqlite host_group get_variables <host_group_name>
+
+    Service manipulation:
+      sqlite service <add|delete> <service_name>
+      sqlite service list
+      sqlite service set_parent <service_name> <parent_service_name>
+      sqlite service set_variable <service_name> <var_name> <json_var_value>
+      sqlite service get_variables <service_name>
+
+    Service instance manipulation:
+      sqlite service_instance add <host_name> <service_name> <local_service_name> <service_ip>
+      sqlite service_instance clone <src_host_name> <service_name> <local_service_name> <host_name> <service_ip>
+      sqlite service_instance update <host_name> <service_name> <local_service_name> <service_ip>
+      sqlite service_instance delete <host_name> <service_name> <local_service_name>
+      sqlite service_instance list 
+      sqlite service_instance list_by_host <host_name>
+      sqlite service_instance list_by_service <service_name>
+      sqlite service_instance set_variable <host_name> <service_name> <local_service_name> <var_name> <json_var_value>
+      sqlite service_instance get_variables <host_name> <service_name> <local_service_name> 
+''')
+
+def bail(exit_code=1):
+    sys.exit(exit_code)
+
+def static_vars(**kwargs):
+    def decorate(func):
+        for k in kwargs:
+            setattr(func, k, kwargs[k])
+        return func
+    return decorate
+
+@static_vars(result_memoization=None)
+def db_connection(databaseFile=None):
+    if databaseFile is None:
+        databaseFile = os.path.dirname(os.path.realpath(__file__)) + "/../database.sqlite"
+    if db_connection.result_memoization is None:
+        db_connection.result_memoization = sqlite3.connect(databaseFile)
+        db_upgrade()
+    return db_connection.result_memoization
+
+def db_upgrade():
+    if 0 == len(db_query("SELECT name FROM sqlite_master WHERE type='table' AND name='db_version'")):
+        db_create()
+    (version,) = db_query("SELECT version FROM db_version LIMIT 1")[0]
+    # Upgrade between versions here (not needed, as there is only one db version as of right now)
+    if version != 1:
+        raise Exception("Version database is more advanced than current inventory script module version")
+
+def db_create():
+    for line in '''
+CREATE TABLE host_group(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES host_groups(id), name TEXT);
+CREATE TABLE host(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE variable(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE service(id INTEGER PRIMARY KEY, name TEXT, parent references service(id));
+CREATE TABLE host_variable(variable INTEGER NOT NULL REFERENCES variable(id), host INTEGER NOT NULL REFERENCES host(id), value TEXT NOT NULL, PRIMARY KEY (variable, host));
+CREATE TABLE service_variable(variable INTEGER NOT NULL REFERENCES variable(id), "service" INTEGER NOT NULL REFERENCES "service"(id), value TEXT NOT NULL, PRIMARY KEY (variable, "service"));
+CREATE TABLE service_instance(id INTEGER PRIMARY KEY, "service" INTEGER NOT NULL REFERENCES "service"(id), host INTEGER NOT NULL REFERENCES host(id), ip TEXT NOT NULL, name TEXT NOT NULL, unique (service, host, ip), unique(service, host, name));
+CREATE TABLE service_instance_variable(variable INTEGER NOT NULL REFERENCES variable(id), instance INTEGER NOT NULL REFERENCES service_instance(id), value TEXT NOT NULL, primary key (variable, instance));
+CREATE TABLE host_group_variable(variable INTEGER NOT NULL REFERENCES variable(id), "group" INTEGER NOT NULL REFERENCES "group"(id), value TEXT NOT NULL, PRIMARY KEY (variable, "group"));
+CREATE TABLE host_group_membership(host integer references host(id), "group" integer references host_group(id), primary key (host, "group"));
+CREATE TABLE db_version(key text primary key check (key = 'single-row'), version integer);
+INSERT INTO db_version VALUES('single-row', 1);
+    '''.split("\n"):
+        if ';' in line: db_query(line)
+    db_connection().commit()
+
+def db_query(query, *args):
+    conn = db_connection()
+    c = conn.cursor()
+    c.execute(query, args)
+    result = c.fetchall()
+    c.close()
+    return result
+
+def db_data_manipulation(query, *args):
+    conn = db_connection()
+    c = conn.cursor()
+    c.execute(query, args)
+    conn.commit()
+    c.close()
+
+class Inventory:
+    @staticmethod
+    def _do_list():
+        result = {"_meta": { "hostvars": {} }}
+        for depth,group in Host_Group._list():
+            result[group] = { 'hosts': [], 'vars': {}, 'children': [] }
+            for var_name, ip in db_query(
+'''
+WITH RECURSIVE
+  hierarchical_group(id, parent) AS (
+     SELECT id, parent FROM host_group WHERE name = ? AND parent is NULL
+     UNION ALL 
+     SELECT host_group.id, host_group.parent FROM host_group JOIN hierarchical_group ON hierarchical_group.id = host_group.parent
+  )
+  SELECT service.name || '_' || service_instance.name, service_instance.ip FROM service JOIN service_instance ON service.id = service_instance.service JOIN (SELECT DISTINCT host.id FROM host JOIN host_group_membership ON host_group_membership.host = host.id JOIN hierarchical_group ON host_group_membership."group" = hierarchical_group.id) AS host ON service_instance.host = host.id
+''' , group):
+                if 'upstream' not in result[group]['vars']: result[group]['vars']['upstream'] = {}
+                if var_name not in result[group]['vars']['upstream']: result[group]['vars']['upstream'][var_name] = []
+                result[group]['vars']['upstream'][var_name].append(ip)
+
+        for parent,child in db_query('SELECT p.name, c.name FROM host_group AS p JOiN host_group AS c ON p.id = c.parent ORDER BY p.name'):
+            result[parent]['children'].append(child)
+
+        for group,host in db_query('SELECT host_group.name, host.name FROM host_group JOiN host_group_membership ON host_group_membership."group" = host_group.id JOIN host ON host_group_membership.host = host.id ORDER BY host_group.name, host.name'):
+            result[group]['hosts'].append(host)
+
+        for group, variable, value in db_query('SELECT host_group.name, variable.name, host_group_variable.value FROM host_group_variable JOIN host_group ON (host_group.id = host_group_variable."group") JOIN variable ON (host_group_variable.variable = variable.id) ORDER BY host_group.name'):
+            try:
+                result[group]['vars'][variable] = json.loads(value)
+            except ValueError:
+                sys.stderr.write("Error reading group variable %s with JSON value %s\n" % (variable, value))
+
+
+
+
+        for host, in db_query('SELECT host.name FROM host ORDER BY host.name'):
+            result['_meta']['hostvars'][host] = {}
+            result['_meta']['hostvars'][host]['service_instances'] = Inventory._service_instances(host)
+            result['_meta']['hostvars'][host]['iscsi_disks'] = []
+            result['_meta']['hostvars'][host]['nfs_disks'] = []
+            result['_meta']['hostvars'][host]['service_ips'] = {}
+            for service_name,service_instances_service in result['_meta']['hostvars'][host]['service_instances'].items():
+                for local_service_name,service_instances_localservice in service_instances_service.items():
+                    result['_meta']['hostvars'][host]['service_ips'][service_instances_localservice['ip']] = True
+                    if 'iscsi_disks' in service_instances_localservice['vars']:
+                        result['_meta']['hostvars'][host]['iscsi_disks'].extend(service_instances_localservice['vars']['iscsi_disks'])
+                    if 'nfs_disks' in service_instances_localservice['vars']:
+                        result['_meta']['hostvars'][host]['nfs_disks'].extend(service_instances_localservice['vars']['nfs_disks'])
+                    if 'upstream_aliases' in service_instances_localservice['vars']:
+                        for local_alias in service_instances_localservice['vars']['upstream_aliases']:
+                            full_alias_name = service_name + '_' + local_alias
+                            for depth,group in Host_Group._list():
+                                if 'upstream' not in result[group]['vars']:
+                                    continue
+                                if full_alias_name not in result[group]['vars']['upstream']: result[group]['vars']['upstream'][full_alias_name] = []
+                                result[group]['vars']['upstream'][full_alias_name].append(service_instances_localservice['ip'])
+
+            result['_meta']['hostvars'][host]['service_ips'] = list(result['_meta']['hostvars'][host]['service_ips'].keys())
+
+        for host,variable,value in db_query('SELECT host.name, variable.name, host_variable.value FROM host join host_variable ON host_variable.host = host.id JOIN variable ON host_variable.variable = variable.id ORDER BY host.name, variable.name'):
+            try:
+                result['_meta']['hostvars'][host][variable] = json.loads(value)
+            except ValueError:
+                sys.stderr.write("Error reading host variable %s with JSON value %s\n" % (variable, value))
+        return result
+    @staticmethod
+    def do_list(output_yaml):
+        result = Inventory._do_list()
+        if output_yaml:
+            print(yaml.dump(result))
+        else:
+            print(json.dumps(result, indent=True))
+
+    @staticmethod
+    def _service_instances(host):
+        result = {}
+        for service, in db_query("SELECT name FROM service"):
+            result[service] = {}
+        for service,localname,ip in db_query("SELECT service.name, service_instance.name, service_instance.ip FROM service_instance JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id WHERE host.name = ? ORDER BY host.name, service.name", host):
+            result[service][localname] = { 'service': service, 'ip': ip }
+            result[service][localname]['hierarchy'] = []
+            for name, in db_query(
+'''
+WITH RECURSIVE
+  hierarchical_service(id, name, parent) AS (
+     SELECT id, name, parent FROM service WHERE name = ?
+     UNION ALL
+     SELECT service.id, service.name, service.parent FROM hierarchical_service JOIN service ON service.id = hierarchical_service.parent
+  )
+  SELECT name FROM hierarchical_service;
+'''
+            , service):
+                result[service][localname]['hierarchy'].append(name)
+            result[service][localname]['vars'] = {}
+            for (var_name, var_value, var_origin) in Service_Instance._get_vars(host, service, localname):
+                try:
+                    result[service][localname]['vars'][var_name] = json.loads(var_value)
+                except ValueError:
+                    sys.stderr.write("Error reading service instance variable %s with JSON value %s\n" % (var_name, var_value))
+
+        return result;
+
+    @staticmethod
+    def do_host(host_name, output_yaml, clean_service_instances):
+        complete = Inventory._do_list()
+        result = complete['_meta']['hostvars'][host_name]
+        groups = []
+        for group_name,group_data in complete.items():
+            if group_name == '_meta': continue
+            if 'hosts' not in group_data or 'children' not in group_data: continue
+            if host_name in group_data['hosts']: groups.append(group_name)
+        while True:
+            next_level = []
+            for group_name,group_data in complete.items():
+                if group_name == '_meta': continue
+                if 'hosts' not in group_data or 'children' not in group_data: continue
+                if group_name in groups: continue
+                if bool([g for g in group_data['children'] if g in groups]): next_level.append(group_name)
+            if len(next_level) == 0: break
+            groups.extend(next_level)
+        
+        for group_name in groups:
+            for var_name,var_value in complete[group_name]['vars'].items():
+                if var_name not in result: result[var_name] = var_value
+        
+        if clean_service_instances:
+            result['service_instances'] = {key: val for key,val in result['service_instances'].items() if len(val) > 0}
+
+        if output_yaml:
+            print(yaml.dump(result))
+        else:
+            print(json.dumps(result, indent=True))
+
+class Host:
+    @staticmethod
+    def do_list():
+        for row in db_query("SELECT name FROM host ORDER BY name"):
+            print("%s" % (row[0],))
+
+    @staticmethod
+    def do_add(host_name):
+        server_index = db_query("select max(value)+1 from variable join host_variable on variable.id = host_variable.variable where variable.name = 'server_index'")[0][0]
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) > 0:
+            sys.stderr.write("Host %s already exists\n\n" % (host_name,))
+            bail(2)
+        db_data_manipulation("INSERT INTO host(name) VALUES (?)", host_name)
+        Host.do_set_var(host_name, "server_index", str(server_index))
+
+    @staticmethod
+    def do_delete(host_name):
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) > 0:
+            db_data_manipulation("DELETE FROM host WHERE name = ?", host_name)
+
+    @staticmethod
+    def do_set_var(host_name, var_name, var_value):
+        try:
+            test = json.loads(var_value)
+        except ValueError:
+            sys.stderr.write("Value %s is not a valid JSON string\n" % var_value)
+            bail(2)
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host %s does not exist\n\n" % (host_name,))
+            bail(2)
+        var = db_query("SELECT id FROM variable WHERE name = ?", var_name)
+        if len(var) == 0:
+            db_data_manipulation("INSERT INTO variable(name) VALUES(?)", var_name)
+        existing_variable_value = db_query("SELECT * FROM host_variable JOIN host ON (host_variable.host = host.id) JOIN variable ON (host_variable.variable = variable.id) WHERE host.name = ? AND variable.name = ?", host_name, var_name)
+        if len(existing_variable_value) == 0:
+            db_data_manipulation("INSERT INTO host_variable(variable, host, value) SELECT variable.id, host.id, ? FROM host CROSS JOIN variable WHERE host.name = ? AND variable.name = ?", var_value, host_name, var_name)
+        else:
+            db_data_manipulation("UPDATE host_variable SET value = ? WHERE host_variable.variable = (SELECT id FROM variable WHERE name = ?) and host_variable.host = (SELECT id FROM host WHERE host.name = ?)", var_value,var_name, host_name)
+
+    @staticmethod
+    def _get_vars(host_name):
+        return db_query("""
+WITH RECURSIVE
+  hierarchical_host_group(id, name, parent, depth) AS (
+     SELECT host_group.id, host_group.name, host_group.parent, 0 FROM host_group JOIN host_group_membership ON host_group.id = host_group_membership."group" JOIN host ON host.id = host_group_membership.host WHERE host.name = ?
+     UNION ALL
+     SELECT host_group.id, host_group.name, host_group.parent, depth+1 FROM hierarchical_host_group JOIN host_group ON hierarchical_host_group.parent = host_group.id
+  ),
+ flattened(depth, variable, value, sourcename) AS (
+   SELECT hierarchical_host_group.depth+1, variable.id, host_group_variable.value, hierarchical_host_group.name
+   FROM hierarchical_host_group JOIN host_group_variable ON hierarchical_host_group.id = host_group_variable."group" JOIN variable ON variable.id = host_group_variable.variable
+   UNION ALL
+   SELECT 0 AS depth, variable.id, host_variable.value, variable.name FROM host JOIN host_variable ON host_variable.host = host.id JOIN variable ON variable.id = host_variable.variable WHERE host.name = ?
+ )
+SELECT
+ variable.name AS name,
+ flattened.value AS value,
+ flattened.sourcename AS sourcename,
+ flattened.depth as depth
+FROM
+ (SELECT flattened.* FROM (SELECT min(depth) AS depth, variable AS variable FROM flattened GROUP BY variable) AS foo JOIN flattened ON (foo.depth = flattened.depth AND foo.variable = flattened.variable)) AS flattened
+ JOIN
+ variable ON flattened.variable = variable.id
+""", host_name, host_name)
+    
+    @staticmethod
+    def do_get_vars(host_name):
+        for row in Host._get_vars(host_name):
+            print("%s = %s # From %s: %s" % (row[0], row[1], 'host' if row[3] == 0 else 'host group', row[2]))
+
+    @staticmethod
+    def do_setgroups(host_name, groups):
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host %s does not exist\n\n" % (host_name,))
+            bail(2)
+        groups = groups.split(',')
+        for group_name in groups:
+            existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+            if len(existing) == 0:
+                sys.stderr.write("Host group %s does not exist\n\n" % (group_name,))
+                bail(3)
+        placeholders = ','.join(['?'] * len(groups))
+        args = [host_name] + groups
+        db_data_manipulation("DELETE FROM host_group_membership WHERE host = (SELECT id FROM host WHERE name = ?) AND \"group\" NOT IN (SELECT id FROM host_group WHERE name IN (%s))" % (placeholders,), *args)
+        db_data_manipulation("INSERT INTO host_group_membership(host, \"group\") SELECT host.id, host_group.id FROM host CROSS JOIN host_group WHERE host.name = ? AND host_group.id IN (SELECT id FROM host_group WHERE name IN (%s)) AND host_group.id NOT IN (SELECT \"group\" FROM host_group_membership WHERE host = host.id)" % (placeholders,), *args)
+
+    @staticmethod
+    def do_addgroup(host_name, group_name):
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host %s does not exist\n\n" % (host_name,))
+            bail(2)
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host group %s does not exist\n\n" % (group_name,))
+            bail(3)
+        existing = db_query("SELECT * FROM host_group_membership WHERE \"group\" = (SELECT id FROM host_group WHERE name = ?) AND host = (SELECT id FROM host WHERE name = ?)", group_name, host_name)
+        if len(existing) == 0:
+            db_data_manipulation("INSERT INTO host_group_membership(host, \"group\") SELECT host.id, host_group.id FROM host CROSS JOIN host_group WHERE host.name = ? AND host_group.name = ?", host_name, group_name)
+
+    @staticmethod
+    def do_removegroup(host_name, group_name):
+        existing = db_query("SELECT id FROM host WHERE name = ?", host_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host %s does not exist\n\n" % (host_name,))
+            bail(2)
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host group %s does not exist\n\n" % (group_name,))
+            bail(3)
+        db_data_manipulation("DELETE FROM host_group_membership WHERE \"group\" = (SELECT id FROM host_group WHERE name = ?) AND host = (SELECT id FROM host WHERE name = ?)", group_name, host_name)
+
+    @staticmethod
+    def do_getgroups(host_name):
+        result = db_query(
+    '''
+WITH RECURSIVE
+  hierarchical_host_group(id, name, parent, depth, sort_key) AS (
+     SELECT host_group.id, host_group.name, host_group.parent, 0, '_' || host_group.id FROM host_group JOIN host_group_membership ON host_group_membership."group" = host_group.id JOIN host ON host.id = host_group_membership.host WHERE host.name = ?
+     UNION ALL
+     SELECT host_group.id, host_group.name, host_group.parent, depth+1, sort_key || '_' || host_group.id FROM hierarchical_host_group JOIN host_group ON hierarchical_host_group.parent = host_group.id
+  ),
+  hierarchical_all_host_groups(id, name, depth) AS (
+     SELECT host_group.id, host_group.name, 0 FROM host_group WHERE parent IS NULL
+     UNION ALL
+     SELECT host_group.id, host_group.name, depth+1 FROM hierarchical_all_host_groups JOIN host_group ON host_group.parent = hierarchical_all_host_groups.id
+  )
+SELECT hierarchical_all_host_groups.id, hierarchical_all_host_groups.name, hierarchical_all_host_groups.depth FROM hierarchical_host_group JOIN hierarchical_all_host_groups ON hierarchical_host_group.id = hierarchical_all_host_groups.id ORDER BY sort_key DESC
+    ''', host_name)
+        for row in result:
+            print("%s%s" % ('  ' * row[2], row[1]))
+
+    @staticmethod
+    def do_usedvariables():
+        result = db_query('select distinct variable.name from variable join host_variable on (variable.id = host_variable.variable) order by variable.name')
+        for (var_name,) in result:
+            print(var_name)
+
+class Host_Group:
+    @staticmethod
+    def do_add(group_name):
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) > 0:
+            sys.stderr.write("Host group %s already exists\n\n" % (group_name,))
+            bail(2)
+        db_data_manipulation("INSERT INTO host_group(name) VALUES (?)", group_name)
+
+    @staticmethod
+    def do_delete(group_name):
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) > 0:
+            db_data_manipulation("DELETE FROM host_group WHERE name = ?", group_name)
+
+    @staticmethod
+    def do_setparent(group_name, *args):
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host group %s does not exist\n\n" % (group_name,))
+            bail(3)
+        if len(args) == 0:
+            db_data_manipulation("UPDATE host_group SET parent = NULL where id = ?", existing[0][0])
+        else:
+            parent = db_query("SELECT id FROM host_group WHERE name = ?", args[0])
+            if len(parent) == 0:
+                sys.stderr.write("Host group %s does not exist\n\n" % (args[0],))
+                bail(3)
+            db_data_manipulation("UPDATE host_group SET parent = ? where id = ?", parent[0][0], existing[0][0])
+            
+    @staticmethod
+    def do_gethosts(group_name):
+        result = db_query(
+    '''
+WITH RECURSIVE
+  hierarchical_host_group(id, name, parent, depth, sort_key) AS (
+     SELECT host_group.id, host_group.name, host_group.parent, 0, '_' || host_group.id FROM host_group WHERE host_group.name = ?
+     UNION ALL
+     SELECT host_group.id, host_group.name, host_group.parent, depth+1, sort_key || '_' || host_group.id FROM hierarchical_host_group JOIN host_group ON hierarchical_host_group.id = host_group.parent
+  )
+SELECT host.name FROM host JOIN host_group_membership ON host.id = host_group_membership.host JOIN hierarchical_host_group ON host_group_membership."group" = hierarchical_host_group.id ORDER BY host.name
+    ''', group_name)
+        for row in result:
+            print("%s" % (row[0],))
+    @staticmethod
+    def _list():
+        return db_query(
+"""
+WITH RECURSIVE
+  hierarchical_host_group(id, name, parent, depth, sort_key) AS (
+     SELECT id, name, parent, 0, '_' || host_group.id FROM host_group WHERE parent IS NULL
+     UNION ALL
+     SELECT host_group.id, host_group.name, host_group.parent, depth+1, sort_key || '_' || host_group.id FROM hierarchical_host_group JOIN host_group ON hierarchical_host_group.id = host_group.parent
+  )
+  SELECT depth, name FROM hierarchical_host_group ORDER by sort_key
+"""
+        )
+    @staticmethod
+    def do_list():
+        for row in Host_Group._list():
+            print("%s%s" % ('  ' * row[0], row[1]))
+
+    @staticmethod
+    def do_set_var(group_name, var_name, var_value):
+        try:
+            test = json.loads(var_value)
+        except ValueError:
+            sys.stderr.write("Value %s is not a valid JSON string\n" % var_value)
+            bail(2)
+        existing = db_query("SELECT id FROM host_group WHERE name = ?", group_name)
+        if len(existing) == 0:
+            sys.stderr.write("Host group %s does not exist\n\n" % (group_name,))
+            bail(3)
+        var = db_query("SELECT id FROM variable WHERE name = ?", var_name)
+        if len(var) == 0:
+            db_data_manipulation("INSERT INTO variable(name) VALUES(?)", var_name)
+        existing_variable_value = db_query("SELECT * FROM host_group_variable JOIN host_group ON (host_group_variable.\"group\" = host_group.id) JOIN variable ON (host_group_variable.variable = variable.id) WHERE host_group.name = ? AND variable.name = ?", group_name, var_name)
+        if len(existing_variable_value) == 0:
+            db_data_manipulation("INSERT INTO host_group_variable(variable, \"group\", value) SELECT variable.id, host_group.id, ? FROM host_group CROSS JOIN variable WHERE host_group.name = ? AND variable.name = ?", var_value, group_name, var_name)
+        else:
+            db_data_manipulation("UPDATE host_group_variable SET value = ? WHERE host_group_variable.variable = (SELECT id FROM variable WHERE name = ?) and host_group_variable.\"group\" = (SELECT id FROM host_group WHERE host_group.name = ?)", var_value,var_name, group_name)
+
+    @staticmethod
+    def _get_vars(group_name):
+        return db_query(
+"""
+WITH RECURSIVE
+  hierarchical_host_group(id, name, parent, depth) AS (
+     SELECT id, name, parent, 0 FROM host_group WHERE name = ?
+     UNION ALL
+     SELECT host_group.id, host_group.name, host_group.parent, depth+1 FROM hierarchical_host_group JOIN host_group ON hierarchical_host_group.parent = host_group.id
+  ),
+ flattened(depth, variable, value, groupname) AS (
+   SELECT hierarchical_host_group.depth, variable.id, host_group_variable.value, hierarchical_host_group.name
+   FROM hierarchical_host_group JOIN host_group_variable ON hierarchical_host_group.id = host_group_variable."group" JOIN variable ON variable.id = host_group_variable.variable
+ ) 
+SELECT
+ variable.name AS name,
+ flattened.value AS value,
+ flattened.groupname AS sourcegroupname
+FROM
+ (SELECT flattened.* FROM (SELECT min(depth) AS depth, variable AS variable FROM flattened GROUP BY variable) AS foo JOIN flattened ON (foo.depth = flattened.depth AND foo.variable = flattened.variable)) AS flattened
+ JOIN
+ variable ON flattened.variable = variable.id
+"""
+        , group_name)
+
+    @staticmethod
+    def do_get_vars(group_name):
+        for row in Host_Group._get_vars(group_name):
+            print("%s = %s # From host group: %s" % row)
+    
+    @staticmethod
+    def do_usedvariables():
+        result = db_query('select distinct variable.name from variable join host_group_variable on (variable.id = host_group_variable.variable) order by variable.name')
+        for (var_name,) in result:
+            print(var_name)
+
+
+
+class Service:
+    @staticmethod
+    def do_list():
+        for row in db_query(
+'''
+WITH RECURSIVE
+  hierarchical_service(id, name, parent, depth, sort_key) AS (
+     SELECT id, name, parent, 0, '_' || id FROM service WHERE parent is null
+     UNION ALL 
+     SELECT service.id, service.name, service.parent, depth+1, sort_key || '_' || service.id FROM service JOIN hierarchical_service ON hierarchical_service.id = service.parent
+  )
+select name,depth from hierarchical_service order by sort_key ASC;
+'''
+        ):
+            print("%s%s" % ('  ' * row[1], row[0]))
+
+    @staticmethod
+    def do_add(service_name):
+        existing = db_query("SELECT id FROM service WHERE name = ?", service_name)
+        if len(existing) > 0:
+            sys.stderr.write("Service %s already exists\n\n" % (service_name,))
+            bail(2)
+        db_data_manipulation("INSERT INTO service(name) VALUES (?)", service_name)
+
+    @staticmethod
+    def do_delete(service_name):
+        existing = db_query("SELECT id FROM service WHERE name = ?", service_name)
+        if len(existing) > 0:
+            db_data_manipulation("DELETE FROM service WHERE name = ?", service_name)
+
+    @staticmethod
+    def do_set_parent(service_name, parent_service_name):
+        existing = db_query("SELECT id FROM service WHERE name = ?", service_name)
+        if len(existing) == 0:
+            sys.stderr.write("Service %s does not exist\n\n" % (service_name,))
+            bail(2)
+        existing = db_query("SELECT id FROM service WHERE name = ?", parent_service_name)
+        if len(existing) == 0:
+            sys.stderr.write("Service %s does not exist\n\n" % (parent_service_name,))
+            bail(2)
+        db_data_manipulation("UPDATE service SET parent = (SELECT id FROM service WHERE name = ?) WHERE name = ?", parent_service_name, service_name)
+
+    @staticmethod
+    def do_set_var(service_name, var_name, var_value):
+        try:
+            test = json.loads(var_value)
+        except ValueError:
+            sys.stderr.write("Value %s is not a valid JSON string\n" % var_value)
+            bail(2)
+        existing = db_query("SELECT id FROM service WHERE name = ?", service_name)
+        if len(existing) == 0:
+            sys.stderr.write("Service %s does not exist\n\n" % (service_name,))
+            bail(2)
+        var = db_query("SELECT id FROM variable WHERE name = ?", var_name)
+        if len(var) == 0:
+            db_data_manipulation("INSERT INTO variable(name) VALUES(?)", var_name)
+        existing_variable_value = db_query("SELECT * FROM service_variable JOIN service ON (service_variable.service = service.id) JOIN variable ON (service_variable.variable = variable.id) WHERE service.name = ? AND variable.name = ?", service_name, var_name)
+        if len(existing_variable_value) == 0:
+            db_data_manipulation("INSERT INTO service_variable(variable, service, value) SELECT variable.id, service.id, ? FROM service CROSS JOIN variable WHERE service.name = ? AND variable.name = ?", var_value, service_name, var_name)
+        else:
+            db_data_manipulation("UPDATE service_variable SET value = ? WHERE service_variable.variable = (SELECT id FROM variable WHERE name = ?) and service_variable.service = (SELECT id FROM service WHERE service.name = ?)", var_value,var_name, service_name)
+
+    @staticmethod
+    def do_get_vars(service_name):
+        result = db_query(
+"""
+WITH RECURSIVE
+  hierarchical_service(id, name, parent, depth) AS (
+     SELECT id, name, parent, 0 FROM service WHERE name = ?
+     UNION ALL 
+     SELECT service.id, service.name, service.parent, depth+1 FROM service JOIN hierarchical_service ON hierarchical_service.parent = service.id
+  ),
+  flattened(depth, variable, value, servicename) AS (
+   SELECT hierarchical_service.depth, variable.id, service_variable.value, hierarchical_service.name
+   FROM hierarchical_service JOIN service_variable ON hierarchical_service.id = service_variable.service JOIN variable ON variable.id = service_variable.variable
+ ) 
+SELECT 
+ variable.name AS name,
+ flattened.value AS value,
+ flattened.servicename AS sourceservicename
+FROM
+ (SELECT flattened.* FROM (SELECT min(depth) AS depth, variable AS variable FROM flattened GROUP BY variable) AS foo JOIN flattened ON (foo.depth = flattened.depth AND foo.variable = flattened.variable)) AS flattened
+ JOIN   
+ variable ON flattened.variable = variable.id
+"""
+        , service_name)
+        for row in result:
+            print("%s = %s # From service: %s" % row)
+
+    @staticmethod
+    def do_usedvariables():
+        result = db_query('select distinct variable.name from variable join service_variable on (variable.id = service_variable.variable) order by variable.name')
+        for (var_name,) in result:
+            print(var_name)
+
+class Service_Instance:
+    @staticmethod
+    def do_add(host_name, service_name, local_service_name, service_ip):
+        existing = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(existing) > 0:
+            sys.stderr.write("Service (%s, %s, %s) already exists\n\n" % (host_name, service_name, local_service_name))
+            bail(2)
+        db_data_manipulation("INSERT INTO service_instance(service, host, name, ip) SELECT service.id, host.id, ?, ? FROM service CROSS JOIN host WHERE service.name = ? AND host.name = ?", local_service_name, service_ip, service_name, host_name)
+
+    @staticmethod
+
+    def do_clone(src_host_name, service_name, local_service_name, host_name, service_ip):
+        existing = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(existing) > 0:
+            sys.stderr.write("Service (%s, %s, %s) already exists\n\n" % (host_name, service_name, local_service_name))
+            bail(2)
+        db_data_manipulation("INSERT INTO service_instance(service, host, name, ip) SELECT service.id, host.id, ?, ? FROM service CROSS JOIN host WHERE service.name = ? AND host.name = ?", local_service_name, service_ip, service_name, host_name)
+        instance = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(instance) == 0:
+            sys.stderr.write("Service (%s, %s, %s) does not exist\n\n" % (host_name, service_name, local_service_name))
+            bail(2)
+        instance = instance[0][0]
+        for variable in db_query("SELECT service_instance_variable.variable, service_instance_variable.value FROM service_instance_variable JOIN service_instance ON service_instance_variable.instance = service_instance.id WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", src_host_name, service_name, local_service_name):
+            db_data_manipulation("INSERT INTO service_instance_variable(variable, instance, value) VALUES(?, ?, ?)", variable[0], instance, variable[1])
+
+    @staticmethod
+    def do_update(host_name, service_name, local_service_name, service_ip):
+        existing = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(existing) == 0:
+            sys.stderr.write("Service (%s, %s, %s) does not exist\n\n" % (host_name, service_name, local_service_name))
+            bail(2)
+        db_data_manipulation("UPDATE service_instance SET ip = ? WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", service_ip, host_name, service_name, local_service_name)
+
+    @staticmethod
+    def do_delete(host_name, service_name, local_service_name):
+        existing = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(existing) > 0:
+            db_data_manipulation("DELETE FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+
+    @staticmethod
+    def do_list():
+        Service_Instance.do_list_print(db_query("SELECT host.name, service.name || '_' || service_instance.name, service_instance.ip  FROM service_instance JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id ORDER BY host.name, service.name"))
+
+    @staticmethod
+    def do_list_by_host(host_name):
+        do_list_print(db_query("SELECT host.name, service.name || '_' || service_instance.name, service_instance.ip  FROM service_instance JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id WHERE host.name = ? ORDER BY host.name, service.name", host_name))
+
+    @staticmethod
+    def do_list_by_service(service_name):
+        do_list_print(db_query("SELECT host.name, service.name || '_' || service_instance.name, service_instance.ip  FROM service_instance JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id WHERE service.name = ? ORDER BY host.name, service.name", service_name))
+
+    @staticmethod
+    def do_list_print(raw):
+        result = {}
+        for service_instance in raw:
+            if service_instance[0] not in result: result[service_instance[0]] = []
+            result[service_instance[0]].append({ 'name': service_instance[1], 'ip': service_instance[2] })
+        for server,service_instances in result.items():
+            print(server)
+            for service_instance in service_instances:
+                print("  %s@%s" % (service_instance['name'], service_instance['ip']))
+
+    @staticmethod
+    def do_set_var(host_name, service_name, local_service_name, var_name, var_value):
+        try:
+            test = json.loads(var_value)
+        except ValueError:
+            sys.stderr.write("Value %s is not a valid JSON string\n" % var_value)
+            bail(2)
+        existing = db_query("SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?", host_name, service_name, local_service_name)
+        if len(existing) == 0:
+            sys.stderr.write("Service (%s, %s, %s) does not exist\n\n" % (host_name, service_name, local_service_name))
+            bail(2)
+        if var_value == '':
+            db_data_manipulation("DELETE FROM service_instance_variable WHERE service_instance_variable.variable = (SELECT id FROM variable WHERE name = ?) AND service_instance_variable.instance = (SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE host.name = ?) AND service = (SELECT id FROM service WHERE service.name = ?) AND service_instance.name = ?)", var_name, host_name, service_name, local_service_name)
+            return
+        var = db_query("SELECT id FROM variable WHERE name = ?", var_name)
+        if len(var) == 0:
+            db_data_manipulation("INSERT INTO variable(name) VALUES(?)", var_name)
+        existing_variable_value = db_query("SELECT service_instance_variable.instance, service_instance_variable.variable FROM service_instance_variable JOIN service_instance ON service_instance.id = service_instance_variable.instance JOIN variable ON variable.id = service_instance_variable.variable WHERE service_instance.id = (SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE host.name = ?) AND service = (SELECT id FROM service WHERE service.name = ?) AND service_instance.name = ? AND variable.name = ?)", host_name, service_name, local_service_name, var_name)
+        if len(existing_variable_value) == 0:
+            db_data_manipulation("INSERT INTO service_instance_variable(variable, instance, value) SELECT variable.id, service_instance.id, ? FROM service_instance CROSS JOIN variable WHERE service_instance.id = (SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?) AND variable.id = (SELECT id FROM variable WHERE name = ?)", var_value, host_name, service_name, local_service_name, var_name)
+        else:
+            db_data_manipulation("UPDATE service_instance_variable SET value = ? WHERE instance = (SELECT id FROM service_instance WHERE host = (SELECT id FROM host WHERE name = ?) AND service = (SELECT id FROM service WHERE name = ?) AND name = ?) AND variable = (SELECT id FROM variable WHERE name = ?)", var_value, host_name, service_name, local_service_name, var_name)
+
+    @staticmethod
+    def _get_vars(host_name, service_name, local_service_name):
+        result = db_query(
+'''
+WITH RECURSIVE
+  hierarchical_service(id, name, parent, depth) AS (
+     SELECT service.id, service.name, service.parent, 1 FROM service JOIN service_instance ON service_instance.service = service.id JOIN host ON service_instance.host = host.id WHERE host.name = ? AND service.name = ? AND service_instance.name = ?
+     UNION ALL 
+     SELECT service.id, service.name, service.parent, depth+1 FROM service JOIN hierarchical_service ON hierarchical_service.parent = service.id
+  ),
+  flattened(depth, variable, value, servicename) AS (
+   SELECT hierarchical_service.depth, variable.id, service_variable.value, hierarchical_service.name
+   FROM hierarchical_service JOIN service_variable ON hierarchical_service.id = service_variable.service JOIN variable ON variable.id = service_variable.variable
+ ) 
+SELECT 
+ variable.name AS name,
+ flattened.value AS value,
+ flattened.servicename AS sourceservicename
+FROM
+ (SELECT flattened.* FROM (SELECT min(depth) AS depth, variable AS variable FROM flattened GROUP BY variable) AS foo JOIN flattened ON (foo.depth = flattened.depth AND foo.variable = flattened.variable)) AS flattened
+ JOIN   
+ variable ON flattened.variable = variable.id
+ WHERE
+ variable.id NOT IN (SELECT service_instance_variable.variable FROM service_instance_variable JOIN service_instance ON service_instance_variable.instance = service_instance.id JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id WHERE host.name = ? AND service.name = ? AND service_instance.name = ?)
+UNION
+ SELECT
+  variable.name,
+  service_instance_variable.value,
+  'service instance' AS sourceservicename
+ FROM variable JOIN service_instance_variable ON variable.id = service_instance_variable.variable JOIN service_instance ON service_instance_variable.instance = service_instance.id JOIN service ON service_instance.service = service.id JOIN host ON service_instance.host = host.id
+ WHERE host.name = ? AND service.name = ? AND service_instance.name = ?
+'''
+        , host_name, service_name, local_service_name, host_name, service_name, local_service_name, host_name, service_name, local_service_name)
+        return result
+
+    @staticmethod
+    def do_get_vars(host_name, service_name, local_service_name):
+        for row in Service_Instance._get_vars(host_name, service_name, local_service_name):
+            print("%s = %s # From: %s" % row)
+    
+    @staticmethod
+    def do_usedvariables():
+        result = db_query('select distinct variable.name from variable join service_instance_variable on (variable.id = service_instance_variable.variable) order by variable.name')
+        for (var_name,) in result:
+            print(var_name)
+
+
+if __name__ == '__main__':
+    parser = OptionParser()
+    parser.add_option("--clean_services", action="store_true", dest="clean_service_instances")
+    parser.add_option("--yaml", action="store_true", dest="yaml")
+    parser.add_option("--list", action="store_true", dest="list")
+    parser.add_option("--host", action="store", dest="host")
+    parser.add_option("--database", action="store", dest="database")
+    (options, args) = parser.parse_args()
+    if options.database:
+        db_connection(options.database)
+    if options.list:
+        Inventory.do_list(options.yaml)
+        sys.exit(0)
+    elif options.host:
+        Inventory.do_host(options.host, options.yaml, options.clean_service_instances)
+        sys.exit(0)
+    
+    if len(args) < 1:
+        usage()
+        bail()
+
+    command_map = {
+            'host': {
+                'list': Host.do_list, 
+                'add': Host.do_add, 
+                'delete': Host.do_delete, 
+                'set_variable': Host.do_set_var, 
+                'get_variables': Host.do_get_vars,
+                'set_groups': Host.do_setgroups, 
+                'add_group': Host.do_addgroup, 
+                'remove_group': Host.do_removegroup, 
+                'get_groups': Host.do_getgroups, 
+                'used_variables': Host.do_usedvariables, 
+            },
+            'host_group': {
+                'list': Host_Group.do_list,
+                'get_hosts': Host_Group.do_gethosts,
+                'add': Host_Group.do_add,
+                'delete': Host_Group.do_delete,
+                'set_parent': Host_Group.do_setparent,
+                'set_variable': Host_Group.do_set_var,
+                'get_variables': Host_Group.do_get_vars,
+                'used_variables': Host_Group.do_usedvariables, 
+            },
+            'service': {
+                'list': Service.do_list, 
+                'add': Service.do_add, 
+                'delete': Service.do_delete, 
+                'set_parent': Service.do_set_parent, 
+                'set_variable': Service.do_set_var, 
+                'get_variables': Service.do_get_vars,
+                'used_variables': Service.do_usedvariables, 
+            },
+            'service_instance': {
+                'add': Service_Instance.do_add, 
+                'clone': Service_Instance.do_clone, 
+                'update': Service_Instance.do_update, 
+                'delete': Service_Instance.do_delete, 
+                'list': Service_Instance.do_list, 
+                'list_by_host': Service_Instance.do_list_by_host, 
+                'list_by_service': Service_Instance.do_list_by_service, 
+                'set_variable': Service_Instance.do_set_var, 
+                'get_variables': Service_Instance.do_get_vars,
+                'used_variables': Service_Instance.do_usedvariables, 
+            }}
+
+    command = args.pop(0)
+    if command == 'help':
+        usage()
+        sys.exit(0)
+    if len(args) < 1:
+        usage()
+        bail()
+    subcommand = args.pop(0)
+
+    if command not in command_map:
+        sys.stderr.write("Command %s unknown. Run sqlite help for usage help\n" % (command,))
+    if subcommand not in command_map[command]:
+        sys.stderr.write("Subcommand %s of command %s unknown. Run sqlite help for usage help\n" % (subcommand, command))
+
+    command_map[command][subcommand](*args)
