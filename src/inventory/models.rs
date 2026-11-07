@@ -63,17 +63,17 @@ pub struct Membership {
     pub group_id: i64,
 }
 
-/// A Group's Own Variable. The schema's foreign key on `group` points at a
-/// table that doesn't exist (ADR 0003).
+/// A Service. `parent` is its Parent Service (a column with no declared
+/// type in the schema, ADR 0003).
 #[derive(Debug, toasty::Model)]
-#[table = "host_group_variable"]
-#[key(variable_id, group_id)]
-pub struct GroupVariable {
-    #[column("variable")]
-    pub variable_id: i64,
+#[table = "service"]
+pub struct Service {
+    #[key]
+    #[auto(increment)]
+    pub id: i64,
 
-    #[column("group")]
-    pub group_id: i64,
+    pub name: String,
 
-    pub value: String,
+    #[column("parent")]
+    pub parent_id: Option<i64>,
 }

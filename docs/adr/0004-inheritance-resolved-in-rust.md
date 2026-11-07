@@ -7,4 +7,4 @@ Groups are ranked the way Ansible ranks them, not by distance from the Host as #
 ## Consequences
 
 - Recursive Inheritance queries do not go through raw SQL, despite ADR 0001's consequence line.
-- The same walk serves Host and Group Effective Variables, and later Service and Service Instance ones.
+- Host and Group Effective Variables share the Group ranking above. A Service inherits from its Parent Services, nearest first, through the same cycle-tolerant walk up the hierarchy; there is no priority among Services.

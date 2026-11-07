@@ -17,6 +17,7 @@ use topcoat::{
 
 mod groups;
 mod hosts;
+mod services;
 mod variables;
 
 use crate::inventory::{self, Inventory};
@@ -53,6 +54,17 @@ pub fn router(inventory: Inventory) -> Router {
         .page(groups::delete_group)
         .page(groups::set_group_variable)
         .page(groups::remove_group_variable)
+        .page(services::services_list)
+        .page(services::new_service_form)
+        .page(services::create_service)
+        .page(services::service_detail)
+        .page(services::rename_service_form)
+        .page(services::rename_service)
+        .page(services::set_service_parent)
+        .page(services::set_service_variable)
+        .page(services::remove_service_variable)
+        .page(services::delete_service_confirmation)
+        .page(services::delete_service)
         .build()
 }
 
@@ -95,6 +107,7 @@ async fn root_layout(slot: Slot<'_>) -> Result<impl View> {
                     <strong>"Lager"</strong>
                     <a href=(href!(hosts::hosts_list))>"Hosts"</a>
                     <a href=(href!(groups::groups_list))>"Groups"</a>
+                    <a href=(href!(services::services_list))>"Services"</a>
                 </nav>
                 <main>(slot)</main>
             </body>

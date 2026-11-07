@@ -9,6 +9,7 @@ use topcoat::{
 };
 
 use super::groups::{GroupId, group_detail};
+use super::services::{ServiceId, service_detail};
 use crate::inventory::{EffectiveVariable, OwnVariable, Source};
 
 /// Which Variable form a rejected submission came from.
@@ -204,6 +205,10 @@ async fn source_link(source: Source) -> Result<impl View> {
             Source::Group { id, name } => {
                 "Group "
                 <a href=(href!(group_detail, GroupId(id)))>(name)</a>
+            },
+            Source::Service { id, name } => {
+                "Service "
+                <a href=(href!(service_detail, ServiceId(id)))>(name)</a>
             },
         }
     })

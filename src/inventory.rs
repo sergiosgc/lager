@@ -6,18 +6,23 @@
 //! says which field was wrong and why.
 
 mod groups;
+mod hierarchy;
 mod hosts;
 mod models;
 mod server_index;
+mod services;
 mod variables;
 
 pub use groups::{Group, GroupDeletion, GroupTreeEntry};
 pub use hosts::{Host, HostDeletion, normalize_host_name};
+pub use services::{Service, ServiceDeletion, ServiceTreeEntry};
 pub use variables::{EffectiveVariable, OwnVariable, Owner, Source};
 
 use groups::*;
+use hierarchy::*;
 use hosts::*;
 use server_index::*;
+use services::*;
 use variables::*;
 
 use std::fmt;
@@ -213,7 +218,7 @@ async fn open_without_foreign_keys(path: &Path) -> toasty::Result<toasty::Db> {
             models::HostVariable,
             models::Group,
             models::Membership,
-            models::GroupVariable
+            models::Service
         ))
         .max_pool_size(1)
         .build(driver)

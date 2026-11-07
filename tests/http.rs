@@ -424,3 +424,65 @@ async fn group_variables_show_as_effective_variables_with_their_source() {
     assert!(effective.contains("<code>8080</code>"), "{effective}");
     assert!(effective.contains("overrides"), "{effective}");
 }
+
+/// Creates a Service through the form and returns its page's path.
+async fn create_service(router: &Router, name: &str) -> String {
+    let created = post_form(router, "/services/new", &format!("name={name}")).await;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    location(&created)
+}
+
+#[tokio::test]
+async fn manages_services_their_parents_and_inherited_variables() {
+    let (_db, router) = app().await;
+    let mysql = create_service(&router, "mysql").await;
+    let mariadb = create_service(&router, "mariadb").await;
+
+    let nested = post_form(
+        &router,
+        &format!("{mariadb}/parent"),
+        &format!("parent={}", id_of(&mysql)),
+    )
+    .await;
+    assert_eq!(nested.status(), StatusCode::SEE_OTHER);
+    let cycle = post_form(
+        &router,
+        &format!("{mysql}/parent"),
+        &format!("parent={}", id_of(&mariadb)),
+    )
+    .await;
+    assert_eq!(cycle.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(cycle).await.contains("mysql → mariadb → mysql"));
+    let list = text(get(&router, "/services").await).await;
+    assert!(
+        list.find(">mysql<").unwrap() < list.find(">mariadb<").unwrap(),
+        "{list}"
+    );
+
+    let set = post_form(
+        &router,
+        &format!("{mysql}/variables"),
+        "form=add&name=port&value=3306",
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::SEE_OTHER);
+    let page = text(get(&router, &mariadb).await).await;
+    let effective = &page[page.find(r#"id="effective""#).unwrap()..];
+    assert!(effective.contains("<code>3306</code>"), "{effective}");
+    assert!(
+        effective.contains(&format!(r#"href="{mysql}""#)),
+        "{effective}"
+    );
+
+    let confirm = text(get(&router, &format!("{mysql}/delete")).await).await;
+    assert!(confirm.contains(">mariadb<"), "{confirm}");
+    assert!(confirm.contains(">port<"), "{confirm}");
+    let deleted = post_form(&router, &format!("{mysql}/delete"), "").await;
+    assert_eq!(location(&deleted), "/services");
+    assert_eq!(get(&router, &mysql).await.status(), StatusCode::NOT_FOUND);
+    assert!(
+        text(get(&router, &mariadb).await)
+            .await
+            .contains("A top-level Service.")
+    );
+}

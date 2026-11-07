@@ -49,7 +49,7 @@ async fn resolved(inventory: &Inventory, owner: Owner, name: &str) -> String {
 fn source_name(source: &Source) -> String {
     match source {
         Source::Own => "own".to_string(),
-        Source::Group { name, .. } => name.clone(),
+        Source::Group { name, .. } | Source::Service { name, .. } => name.clone(),
     }
 }
 

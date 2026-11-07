@@ -4,6 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use toasty::stmt::Value;
+
 use super::*;
 
 /// A Variable set directly on an entity, with its value as JSON text.
@@ -18,6 +20,26 @@ pub struct OwnVariable {
 pub enum Owner {
     Host(i64),
     Group(i64),
+    Service(i64),
+}
+
+impl Owner {
+    /// The table holding this kind of entity's Variable values, and the
+    /// column naming the entity (quoted where it's a reserved word). The
+    /// values are read and written with SQL built from these (ADR 0005).
+    fn value_table(self) -> (&'static str, &'static str) {
+        match self {
+            Owner::Host(_) => ("host_variable", "host"),
+            Owner::Group(_) => ("host_group_variable", r#""group""#),
+            Owner::Service(_) => ("service_variable", "service"),
+        }
+    }
+
+    fn id(self) -> i64 {
+        match self {
+            Owner::Host(id) | Owner::Group(id) | Owner::Service(id) => id,
+        }
+    }
 }
 
 /// Where an Effective Variable's value comes from.
@@ -27,6 +49,8 @@ pub enum Source {
     Own,
     /// Inherited from this Group.
     Group { id: i64, name: String },
+    /// Inherited from this (Parent) Service.
+    Service { id: i64, name: String },
 }
 
 /// The value an entity ends up with once Inheritance is applied.
@@ -73,7 +97,7 @@ impl Inventory {
         write_variable(&mut tx, owner, name, value).await?;
         let warnings = match owner {
             Owner::Host(host_id) => host_warnings(&mut tx, host_id).await?,
-            Owner::Group(_) => Vec::new(),
+            Owner::Group(_) | Owner::Service(_) => Vec::new(),
         };
         tx.commit().await?;
         Ok(Done {
@@ -102,21 +126,18 @@ impl Inventory {
     /// An entity's Effective Variables, sorted by name, each with where its
     /// value comes from.
     ///
-    /// The entity's own value wins. Then come the Groups it inherits from: for
-    /// a Host, its Groups and all their Parent Groups; for a Group, its
-    /// Parent Groups. They are ranked as Ansible ranks them: the deepest
-    /// below the top of the hierarchy first, so a child Group always wins
-    /// over its Parent Group; at the same depth, the highest
-    /// `ansible_group_priority`; then the last by name.
+    /// The entity's own value wins. A Host or a Group then inherits from
+    /// Groups: a Host from its Groups and all their Parent Groups, a Group
+    /// from its Parent Groups. They are ranked as Ansible ranks them: the
+    /// deepest below the top of the hierarchy first, so a child Group always
+    /// wins over its Parent Group; at the same depth, the highest
+    /// `ansible_group_priority`; then the last by name (ADR 0004). A Service
+    /// inherits from its Parent Services, nearest first.
     pub async fn effective_variables(&self, owner: Owner) -> Result<Vec<EffectiveVariable>, Error> {
         let mut db = self.db.clone();
         existing_owner(&mut db, owner).await?;
-        let groups: HashMap<i64, Group> = all_groups(&mut db)
-            .await?
-            .into_iter()
-            .map(|g| (g.id, g))
-            .collect();
-        let ancestors = match owner {
+        let mut layers = vec![(Source::Own, owner_values(&mut db, owner).await?)];
+        layers.extend(match owner {
             Owner::Host(host_id) => {
                 let direct =
                     models::Membership::filter(models::Membership::fields().host_id().eq(host_id))
@@ -125,25 +146,18 @@ impl Inventory {
                         .into_iter()
                         .map(|m| m.group_id)
                         .collect();
-                with_ancestors(&groups, direct)
+                inherited_from_groups(&mut db, direct).await?
             }
             Owner::Group(group_id) => {
-                let parent = groups.get(&group_id).and_then(|g| g.parent_id);
-                with_ancestors(&groups, parent.into_iter().collect())
+                let parent = models::Group::filter_by_id(group_id)
+                    .first()
+                    .exec(&mut db)
+                    .await?
+                    .and_then(|g| g.parent_id);
+                inherited_from_groups(&mut db, parent.into_iter().collect()).await?
             }
-        };
-        let group_values = group_values(&mut db, ancestors.iter().copied()).await?;
-        let ancestors = rank_by_priority(&mut db, &groups, ancestors, &group_values).await?;
-
-        let mut layers = vec![(Source::Own, owner_values(&mut db, owner).await?)];
-        for id in ancestors {
-            let group = &groups[&id];
-            let source = Source::Group {
-                id,
-                name: group.name.clone(),
-            };
-            layers.push((source, group_values.get(&id).cloned().unwrap_or_default()));
-        }
+            Owner::Service(service_id) => inherited_from_services(&mut db, service_id).await?,
+        });
         resolve(&mut db, layers).await
     }
 
@@ -162,31 +176,58 @@ impl Inventory {
     }
 }
 
-/// The Groups in `start` and all their Parent Groups, each once. Stops at
-/// cycles already in the data, and ignores Groups that don't exist.
-fn with_ancestors(groups: &HashMap<i64, Group>, start: Vec<i64>) -> Vec<i64> {
-    let mut seen = HashSet::new();
-    let mut pending = start;
-    while let Some(id) = pending.pop() {
-        if groups.contains_key(&id) && seen.insert(id) {
-            pending.extend(groups[&id].parent_id);
-        }
+/// A value layer: where the values come from, and the values as
+/// `(variable id, value)`.
+type Layer = (Source, Vec<(i64, String)>);
+
+/// The Group layers inherited from the Groups in `start` and all their
+/// Parent Groups, in precedence order.
+async fn inherited_from_groups(
+    db: &mut impl toasty::Executor,
+    start: Vec<i64>,
+) -> Result<Vec<Layer>, Error> {
+    let groups: HashMap<i64, Group> = all_groups(&mut *db)
+        .await?
+        .into_iter()
+        .map(|g| (g.id, g))
+        .collect();
+    let ancestors = with_ancestors(&groups, start);
+    let mut values = HashMap::new();
+    for &id in &ancestors {
+        values.insert(id, owner_values(&mut *db, Owner::Group(id)).await?);
     }
-    seen.into_iter().collect()
+    let ranked = rank_by_priority(&mut *db, &groups, ancestors, &values).await?;
+    Ok(ranked
+        .into_iter()
+        .map(|id| {
+            let source = Source::Group {
+                id,
+                name: groups[&id].name.clone(),
+            };
+            (source, values.remove(&id).unwrap_or_default())
+        })
+        .collect())
 }
 
-/// How many levels a Group sits below the top of the hierarchy: 0 for a
-/// top-level Group. A Group caught in a cycle counts the levels until the
-/// walk up repeats.
-fn depth(groups: &HashMap<i64, Group>, group_id: i64) -> usize {
-    let mut seen = HashSet::from([group_id]);
-    let mut depth = 0;
-    let mut current = groups.get(&group_id).and_then(|g| g.parent_id);
-    while let Some(id) = current.filter(|id| groups.contains_key(id) && seen.insert(*id)) {
-        depth += 1;
-        current = groups[&id].parent_id;
+/// The Parent Service layers a Service inherits from, nearest first.
+async fn inherited_from_services(
+    db: &mut impl toasty::Executor,
+    service_id: i64,
+) -> Result<Vec<Layer>, Error> {
+    let services: HashMap<i64, Service> = all_services(&mut *db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
+    let mut layers = Vec::new();
+    for id in ancestors(&services, service_id) {
+        let source = Source::Service {
+            id,
+            name: services[&id].name.clone(),
+        };
+        layers.push((source, owner_values(&mut *db, Owner::Service(id)).await?));
     }
-    depth
+    Ok(layers)
 }
 
 /// A Group's `ansible_group_priority`, read the way Ansible's `int()` reads
@@ -223,42 +264,21 @@ async fn rank_by_priority(
     };
     let mut ranked = ancestors;
     ranked.sort_by(|a, b| {
-        depth(groups, *b)
-            .cmp(&depth(groups, *a))
+        // Depth below the top of the hierarchy: how many ancestors.
+        hierarchy::ancestors(groups, *b)
+            .len()
+            .cmp(&hierarchy::ancestors(groups, *a).len())
             .then(priority(*b).cmp(&priority(*a)))
             .then(groups[b].name.cmp(&groups[a].name))
     });
     Ok(ranked)
 }
 
-/// The Own Variable values of each of these Groups, as `(variable id,
-/// value)`, keyed by Group id.
-async fn group_values(
-    db: &mut impl toasty::Executor,
-    group_ids: impl Iterator<Item = i64>,
-) -> Result<HashMap<i64, Vec<(i64, String)>>, Error> {
-    let ids: Vec<i64> = group_ids.collect();
-    let mut values: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
-    for row in models::GroupVariable::filter(toasty::stmt::in_list(
-        models::GroupVariable::fields().group_id(),
-        ids,
-    ))
-    .exec(db)
-    .await?
-    {
-        values
-            .entry(row.group_id)
-            .or_default()
-            .push((row.variable_id, row.value));
-    }
-    Ok(values)
-}
-
 /// Picks, for each Variable, the value from the first layer that sets it,
 /// noting the next layer it hides. Layers are in precedence order.
 async fn resolve(
     db: &mut impl toasty::Executor,
-    layers: Vec<(Source, Vec<(i64, String)>)>,
+    layers: Vec<Layer>,
 ) -> Result<Vec<EffectiveVariable>, Error> {
     let ids: HashSet<i64> = layers
         .iter()
@@ -305,6 +325,7 @@ pub(super) async fn existing_owner(
     match owner {
         Owner::Host(id) => existing_host(db, id).await.map(|_| ()),
         Owner::Group(id) => existing_group(db, id).await.map(|_| ()),
+        Owner::Service(id) => existing_service(db, id).await.map(|_| ()),
     }
 }
 
@@ -313,24 +334,19 @@ async fn owner_values(
     db: &mut impl toasty::Executor,
     owner: Owner,
 ) -> Result<Vec<(i64, String)>, Error> {
-    Ok(match owner {
-        Owner::Host(id) => {
-            models::HostVariable::filter(models::HostVariable::fields().host_id().eq(id))
-                .exec(db)
-                .await?
-                .into_iter()
-                .map(|v| (v.variable_id, v.value))
-                .collect()
-        }
-        Owner::Group(id) => {
-            models::GroupVariable::filter(models::GroupVariable::fields().group_id().eq(id))
-                .exec(db)
-                .await?
-                .into_iter()
-                .map(|v| (v.variable_id, v.value))
-                .collect()
-        }
-    })
+    let (table, column) = owner.value_table();
+    let id = owner.id();
+    let sql = format!("SELECT variable, value FROM {table} WHERE {column} = ?1");
+    let rows = toasty::sql::query(&sql).bind(id).exec(db).await?;
+    rows.into_iter()
+        .map(|row| match row {
+            Value::Record(r) => match r.into_iter().collect::<Vec<_>>().as_slice() {
+                [Value::I64(variable), Value::String(value)] => Ok((*variable, value.clone())),
+                other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
+            },
+            other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
+        })
+        .collect()
 }
 
 /// An entity's Own Variables for a delete preview, which must list every
@@ -348,20 +364,12 @@ pub(super) async fn delete_owner_values(
     tx: &mut toasty::Transaction<'_>,
     owner: Owner,
 ) -> Result<(), Error> {
-    match owner {
-        Owner::Host(id) => {
-            models::HostVariable::filter(models::HostVariable::fields().host_id().eq(id))
-                .delete()
-                .exec(tx)
-                .await?
-        }
-        Owner::Group(id) => {
-            models::GroupVariable::filter(models::GroupVariable::fields().group_id().eq(id))
-                .delete()
-                .exec(tx)
-                .await?
-        }
-    }
+    let (table, column) = owner.value_table();
+    let id = owner.id();
+    toasty::sql::statement(format!("DELETE FROM {table} WHERE {column} = ?1"))
+        .bind(id)
+        .exec(tx)
+        .await?;
     Ok(())
 }
 
@@ -370,10 +378,15 @@ async fn delete_value(
     owner: Owner,
     variable_id: i64,
 ) -> Result<(), Error> {
-    match owner {
-        Owner::Host(id) => host_variable(variable_id, id).delete().exec(tx).await?,
-        Owner::Group(id) => group_variable(variable_id, id).delete().exec(tx).await?,
-    }
+    let (table, column) = owner.value_table();
+    let id = owner.id();
+    toasty::sql::statement(format!(
+        "DELETE FROM {table} WHERE {column} = ?1 AND variable = ?2"
+    ))
+    .bind(id)
+    .bind(variable_id)
+    .exec(tx)
+    .await?;
     Ok(())
 }
 
@@ -442,38 +455,18 @@ pub(super) async fn write_variable(
                 .id
         }
     };
-    match owner {
-        Owner::Host(id) => match host_variable(variable_id, id)
-            .first()
-            .exec(&mut *tx)
-            .await?
-        {
-            Some(mut row) => row.update().value(value).exec(&mut *tx).await?,
-            None => {
-                models::HostVariable::create()
-                    .variable_id(variable_id)
-                    .host_id(id)
-                    .value(value)
-                    .exec(&mut *tx)
-                    .await?;
-            }
-        },
-        Owner::Group(id) => match group_variable(variable_id, id)
-            .first()
-            .exec(&mut *tx)
-            .await?
-        {
-            Some(mut row) => row.update().value(value).exec(&mut *tx).await?,
-            None => {
-                models::GroupVariable::create()
-                    .variable_id(variable_id)
-                    .group_id(id)
-                    .value(value)
-                    .exec(&mut *tx)
-                    .await?;
-            }
-        },
-    }
+    let (table, column) = owner.value_table();
+    let id = owner.id();
+    // Each value table's primary key is (variable, entity) (ADR 0003).
+    toasty::sql::statement(format!(
+        "INSERT INTO {table}(variable, {column}, value) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(variable, {column}) DO UPDATE SET value = excluded.value"
+    ))
+    .bind(variable_id)
+    .bind(id)
+    .bind(value.to_string())
+    .exec(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -487,32 +480,6 @@ pub(super) async fn variable_by_name(
             .first()
             .exec(db)
             .await?,
-    )
-}
-
-/// The query for one Host's value of one Variable.
-fn host_variable(
-    variable_id: i64,
-    host_id: i64,
-) -> toasty::schema::QueryMany<models::HostVariable> {
-    models::HostVariable::filter(
-        models::HostVariable::fields()
-            .variable_id()
-            .eq(variable_id)
-            .and(models::HostVariable::fields().host_id().eq(host_id)),
-    )
-}
-
-/// The query for one Group's value of one Variable.
-fn group_variable(
-    variable_id: i64,
-    group_id: i64,
-) -> toasty::schema::QueryMany<models::GroupVariable> {
-    models::GroupVariable::filter(
-        models::GroupVariable::fields()
-            .variable_id()
-            .eq(variable_id)
-            .and(models::GroupVariable::fields().group_id().eq(group_id)),
     )
 }
 

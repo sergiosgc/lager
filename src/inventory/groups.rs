@@ -1,9 +1,6 @@
-//! Groups: their hierarchy (Parent Groups) and their member Hosts.
-//!
-//! Nothing in the schema stops a Group from being its own ancestor (ADR
-//! 0003), and `cli/si` doesn't either (#2), so every walk up or down the
-//! hierarchy tolerates cycles already in the data, while lager itself never
-//! creates one.
+//! Groups: their hierarchy (Parent Groups) and their member Hosts. Walks
+//! through the hierarchy tolerate cycles already in the data (see
+//! [`hierarchy`](super::hierarchy)).
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +12,18 @@ pub struct Group {
     pub id: i64,
     pub name: String,
     pub parent_id: Option<i64>,
+}
+
+impl Node for Group {
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parent_id(&self) -> Option<i64> {
+        self.parent_id
+    }
 }
 
 impl From<models::Group> for Group {
@@ -75,45 +84,10 @@ impl Inventory {
     /// already in the data come last, each listed once.
     pub async fn group_tree(&self) -> Result<Vec<GroupTreeEntry>, Error> {
         let groups = all_groups(&mut self.db.clone()).await?;
-        let ids: HashSet<i64> = groups.iter().map(|g| g.id).collect();
-        let mut children: HashMap<Option<i64>, Vec<&Group>> = HashMap::new();
-        for g in &groups {
-            // A parent that doesn't exist counts as none.
-            let parent = g.parent_id.filter(|p| ids.contains(p));
-            children.entry(parent).or_default().push(g);
-        }
-        for siblings in children.values_mut() {
-            siblings.sort_by(|a, b| a.name.cmp(&b.name));
-        }
-        let mut tree = Vec::new();
-        let mut visited = HashSet::new();
-        let mut stack: Vec<(usize, &Group)> = children
-            .get(&None)
-            .map(|roots| roots.iter().rev().map(|g| (0, *g)).collect())
-            .unwrap_or_default();
-        let mut leftovers: Vec<&Group> = groups.iter().collect();
-        leftovers.sort_by(|a, b| b.name.cmp(&a.name));
-        loop {
-            while let Some((depth, g)) = stack.pop() {
-                if !visited.insert(g.id) {
-                    continue;
-                }
-                tree.push(GroupTreeEntry {
-                    depth,
-                    group: g.clone(),
-                });
-                if let Some(kids) = children.get(&Some(g.id)) {
-                    stack.extend(kids.iter().rev().map(|k| (depth + 1, *k)));
-                }
-            }
-            // Whatever is left is unreachable from a top-level Group: a cycle.
-            match leftovers.pop() {
-                Some(g) if !visited.contains(&g.id) => stack.push((0, g)),
-                Some(_) => {}
-                None => break,
-            }
-        }
-        Ok(tree)
+        Ok(tree_order(&groups)
+            .into_iter()
+            .map(|(depth, group)| GroupTreeEntry { depth, group })
+            .collect())
     }
 
     /// The Groups whose Parent Group is this one, sorted by name.
@@ -339,31 +313,6 @@ async fn unused_group_name(
         ));
     }
     Ok(())
-}
-
-/// If making `parent_id` the Parent Group of `group_id` would create a
-/// cycle, the loop's Group names, starting and ending with `group_id`'s.
-/// Walks up from `parent_id`, stopping at any cycle already in the data.
-fn cycle_through(
-    groups: &HashMap<i64, Group>,
-    group_id: i64,
-    parent_id: i64,
-) -> Option<Vec<String>> {
-    let mut path = vec![groups.get(&group_id)?.name.clone()];
-    let mut visited = HashSet::new();
-    let mut current = Some(parent_id);
-    while let Some(id) = current {
-        let group = groups.get(&id)?;
-        path.push(group.name.clone());
-        if id == group_id {
-            return Some(path);
-        }
-        if !visited.insert(id) {
-            return None;
-        }
-        current = group.parent_id;
-    }
-    None
 }
 
 /// The query for one membership row.
