@@ -300,3 +300,25 @@ async fn reading_a_null_name() {
     let err = Host::all().exec(&mut f.db).await.unwrap_err();
     assert!(err.to_string().contains("cannot convert Null to String"), "{err}");
 }
+
+/// The schema's UNIQUE(service, host, name) declared in Toasty too: a
+/// duplicate Service Instance is rejected, and Toasty generates a lookup by
+/// (Service, Host, Instance Name).
+#[tokio::test]
+async fn service_instance_identity_is_unique() {
+    let mut f = fixture().await;
+    let db = &mut f.db;
+    let host = Host::create().name("db1").exec(db).await.unwrap();
+    let pg = Service::create().name("postgresql").exec(db).await.unwrap();
+    let add = |ip: &str| {
+        ServiceInstance::create().service(&pg).host(&host).name("main").ip(ip.to_string())
+    };
+    add("192.0.2.20").exec(db).await.unwrap();
+    assert!(add("192.0.2.21").exec(db).await.is_err());
+
+    let found =
+        ServiceInstance::get_by_service_id_and_host_id_and_name(db, &pg.id, &host.id, "main")
+            .await
+            .unwrap();
+    assert_eq!(found.ip, "192.0.2.20");
+}

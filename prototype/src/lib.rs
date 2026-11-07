@@ -130,6 +130,7 @@ pub struct ServiceVariable {
 
 #[derive(Debug, toasty::Model)]
 #[table = "service_instance"]
+#[unique(service_id, host_id, name)]
 pub struct ServiceInstance {
     #[key]
     #[auto(increment)]
