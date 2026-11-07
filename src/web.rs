@@ -45,6 +45,8 @@ pub fn router(inventory: Inventory, webroot: &Path) -> Router {
         .page(hosts::remove_host_variable)
         .page(hosts::rename_host_form)
         .page(hosts::rename_host)
+        .page(hosts::clone_host_form)
+        .page(hosts::clone_host)
         .page(hosts::delete_host_confirmation)
         .page(hosts::delete_host)
         .page(hosts::add_host_group)

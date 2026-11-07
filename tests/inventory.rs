@@ -900,3 +900,187 @@ async fn renaming_rejects_a_name_another_host_already_shares() {
         "{err:?}"
     );
 }
+
+// Cloning Hosts
+
+#[tokio::test]
+async fn cloning_a_host_copies_its_variables_groups_and_service_instances() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    inventory.create_host("db1", Some("7")).await.unwrap();
+    inventory
+        .set_variable(Owner::Host(web1.id), "ntp_server", r#""ntp.example.org""#)
+        .await
+        .unwrap();
+    let eu = inventory.create_group("eu").await.unwrap().value;
+    let web = inventory.create_group("web").await.unwrap().value;
+    inventory
+        .set_host_groups(web1.id, &[eu.id, web.id])
+        .await
+        .unwrap();
+    let nginx = inventory.create_service("nginx").await.unwrap().value;
+    let main = inventory
+        .create_service_instance(web1.id, nginx.id, "main", "192.0.2.10")
+        .await
+        .unwrap()
+        .value;
+    inventory
+        .set_variable(Owner::ServiceInstance(main.id), "workers", "4")
+        .await
+        .unwrap();
+    inventory
+        .create_service_instance(web1.id, nginx.id, "admin", "192.0.2.11")
+        .await
+        .unwrap();
+
+    let done = inventory.clone_host(web1.id, " Web2 ").await.unwrap();
+    let web2 = done.value;
+
+    assert_eq!(web2.name, "web2");
+    assert_ne!(web2.id, web1.id);
+    assert_eq!(
+        variables_besides_server_index(&inventory, web2.id).await,
+        [own("ntp_server", r#""ntp.example.org""#)]
+    );
+    // A new Server Index, as for any new Host: 1 + the highest (db1's 7).
+    assert_eq!(
+        server_index(&inventory, web2.id).await.as_deref(),
+        Some("8")
+    );
+    let groups: Vec<String> = inventory
+        .host_groups(web2.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|g| g.name)
+        .collect();
+    assert_eq!(groups, ["eu", "web"]);
+    let instances = inventory.instances_on_host(web2.id).await.unwrap();
+    let got: Vec<(&str, &str, &str)> = instances
+        .iter()
+        .map(|i| (i.service_name.as_str(), i.name.as_str(), i.ip.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("nginx", "admin", "192.0.2.11"),
+            ("nginx", "main", "192.0.2.10")
+        ]
+    );
+    let cloned_main = instances.iter().find(|i| i.name == "main").unwrap();
+    assert_ne!(cloned_main.id, main.id);
+    assert_eq!(
+        inventory
+            .own_variables(Owner::ServiceInstance(cloned_main.id))
+            .await
+            .unwrap(),
+        [own("workers", "4")]
+    );
+    assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+    // The source is untouched.
+    assert_eq!(inventory.instances_on_host(web1.id).await.unwrap().len(), 2);
+    assert_eq!(
+        server_index(&inventory, web1.id).await.as_deref(),
+        Some("1")
+    );
+}
+
+#[tokio::test]
+async fn a_cloned_hosts_variables_are_independent_of_the_source() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    inventory
+        .set_variable(Owner::Host(web1.id), "disk_gb", "100")
+        .await
+        .unwrap();
+    let nginx = inventory.create_service("nginx").await.unwrap().value;
+    let main = inventory
+        .create_service_instance(web1.id, nginx.id, "main", "192.0.2.10")
+        .await
+        .unwrap()
+        .value;
+    inventory
+        .set_variable(Owner::ServiceInstance(main.id), "workers", "4")
+        .await
+        .unwrap();
+    let web2 = inventory.clone_host(web1.id, "web2").await.unwrap().value;
+    let cloned_main = inventory.instances_on_host(web2.id).await.unwrap()[0].id;
+
+    inventory
+        .set_variable(Owner::Host(web2.id), "disk_gb", "500")
+        .await
+        .unwrap();
+    inventory
+        .set_variable(Owner::ServiceInstance(cloned_main), "workers", "8")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        variables_besides_server_index(&inventory, web1.id).await,
+        [own("disk_gb", "100")]
+    );
+    assert_eq!(
+        inventory
+            .own_variables(Owner::ServiceInstance(main.id))
+            .await
+            .unwrap(),
+        [own("workers", "4")]
+    );
+}
+
+#[tokio::test]
+async fn cloning_a_host_needs_a_new_unused_name() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+
+    for name in ["WEB1", " !! "] {
+        let err = inventory.clone_host(web1.id, name).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid { field: "name", .. }),
+            "{name:?}: {err:?}"
+        );
+    }
+    assert_eq!(inventory.hosts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cloning_a_host_skips_what_cli_si_left_orphaned() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    // A membership of a missing Group and an instance of a missing Service.
+    sql(
+        &db,
+        &format!(
+            "INSERT INTO host_group_membership(host, \"group\") VALUES ({0}, 999);
+             INSERT INTO service_instance(service, host, name, ip)
+                 VALUES (999, {0}, 'main', '192.0.2.10');",
+            web1.id
+        ),
+    );
+
+    let done = inventory.clone_host(web1.id, "web2").await.unwrap();
+
+    assert_eq!(
+        rows_referring_to(&db, "host_group_membership", "host", done.value.id),
+        0
+    );
+    assert_eq!(
+        rows_referring_to(&db, "service_instance", "host", done.value.id),
+        0
+    );
+    assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+}
+
+#[tokio::test]
+async fn cloning_an_unknown_host_is_not_found() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+
+    let err = inventory.clone_host(999, "web2").await.unwrap_err();
+
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}

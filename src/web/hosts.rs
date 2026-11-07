@@ -1,5 +1,5 @@
 //! Host pages: the list, a Host's page with its Own Variables, and the
-//! create, rename and delete forms.
+//! create, rename, clone and delete forms.
 
 use serde::Deserialize;
 use topcoat::{
@@ -344,6 +344,7 @@ async fn host_view(
         <h1>(host.name.clone())</h1>
         <p class="actions">
             <a href=(href!(rename_host_form, HostId(host_id)))>"Rename"</a>
+            <a href=(href!(clone_host_form, HostId(host_id)))>"Clone…"</a>
             <a href=(href!(delete_host_confirmation, HostId(host_id)))>"Delete…"</a>
         </p>
         if !warnings.is_empty() {
@@ -480,6 +481,68 @@ async fn rename_host_view(host: Host, name: String, error: Option<String>) -> Re
             }
             <p class="actions">
                 <button type="submit">"Rename"</button>
+                <a href=(href!(host_detail, HostId(host.id)))>"Cancel"</a>
+            </p>
+        </form>
+    })
+}
+
+#[derive(Deserialize)]
+pub(super) struct CloneHost {
+    name: String,
+}
+
+#[page("/hosts/{host_id}/clone")]
+pub(super) async fn clone_host_form(cx: &Cx) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    Ok(view! { clone_host_view(host: host, name: String::new(), error: None) })
+}
+
+#[page(POST "/hosts/{host_id}/clone")]
+pub(super) async fn clone_host(cx: &Cx, Form(input): Form<CloneHost>) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    match inventory(cx).clone_host(host.id, &input.name).await {
+        Ok(done) => Err(see_other(href!(host_detail, HostId(done.value.id)).resolve(cx)).into()),
+        Err(inventory::Error::Invalid { message, .. }) => {
+            Ok(view! { clone_host_view(host: host, name: input.name, error: Some(message)) })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+/// The clone form for `host`, showing `name` as typed and the error it was
+/// rejected with, if any.
+#[component]
+async fn clone_host_view(host: Host, name: String, error: Option<String>) -> Result<impl View> {
+    Ok(view! {
+        if error.is_some() {
+            (StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        <h1>"Clone " (host.name.clone())</h1>
+        <p>
+            "Creates a new Host with a copy of " (host.name.clone())
+            "'s Own Variables, Group memberships, and Service Instances with their Own Variables. "
+            "The new Host gets the next Server Index."
+        </p>
+        <form method="post" action=(href!(clone_host, HostId(host.id)))>
+            <label for="name">"New Host name"</label>
+            <input id="name" name="name" value=(name) required=(true) autofocus=(true)
+                if error.is_some() {
+                    aria-invalid="true"
+                    aria-describedby="name-hint name-error"
+                } else {
+                    aria-describedby="name-hint"
+                }
+            >
+            <p id="name-hint" class="hint">
+                "Saved in lowercase, keeping only letters a–z, digits, \"-\" and \"_\". "
+                "The cloned Service Instances keep the same IPs: change them afterwards on each one's page."
+            </p>
+            if let Some(error) = error {
+                <p id="name-error" class="error">(error)</p>
+            }
+            <p class="actions">
+                <button type="submit">"Clone"</button>
                 <a href=(href!(host_detail, HostId(host.id)))>"Cancel"</a>
             </p>
         </form>

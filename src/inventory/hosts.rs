@@ -101,6 +101,60 @@ impl Inventory {
         Ok(Done::ok(host.into()))
     }
 
+    /// Creates a Host named `name` (same rules as on creation) as a copy of
+    /// another: its Own Variables, Group memberships, and Service Instances
+    /// with their Own Variables, all of which then change independently.
+    /// The clone gets [`Inventory::next_server_index`] rather than the
+    /// source's, and its Service Instances keep the source's IPs, for the
+    /// operator to change afterwards. Rows `cli/si` left pointing at missing Groups
+    /// or Services aren't copied.
+    pub async fn clone_host(&self, source_id: i64, name: &str) -> Result<Done<Host>, Error> {
+        let name = normalized_host_name(name)?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        existing_host(&mut tx, source_id).await?;
+        unused_host_name(&mut tx, &name, None).await?;
+        let index = next_server_index(&mut tx).await?;
+        let host = models::Host::create().name(name).exec(&mut tx).await?;
+        copy_owner_values(&mut tx, Owner::Host(source_id), Owner::Host(host.id)).await?;
+        write_variable(
+            &mut tx,
+            Owner::Host(host.id),
+            SERVER_INDEX,
+            &index.to_string(),
+        )
+        .await?;
+        for group in host_groups(&mut tx, source_id).await? {
+            models::Membership::create()
+                .host_id(host.id)
+                .group_id(group.id)
+                .exec(&mut tx)
+                .await?;
+        }
+        let instances = instances_on_host(&mut tx, source_id).await?;
+        for instance in instances.into_iter().filter(|i| i.service_exists) {
+            let row = models::ServiceInstance::create()
+                .service_id(instance.service_id)
+                .host_id(host.id)
+                .name(instance.name)
+                .ip(instance.ip)
+                .exec(&mut tx)
+                .await?;
+            copy_owner_values(
+                &mut tx,
+                Owner::ServiceInstance(instance.id),
+                Owner::ServiceInstance(row.id),
+            )
+            .await?;
+        }
+        let warnings = host_warnings(&mut tx, host.id).await?;
+        tx.commit().await?;
+        Ok(Done {
+            value: host.into(),
+            warnings,
+        })
+    }
+
     /// What deleting a Host would remove, or why it can't be deleted yet.
     /// [`Inventory::delete_host`] removes exactly this.
     pub async fn host_deletion(&self, host_id: i64) -> Result<HostDeletion, Error> {

@@ -39,6 +39,7 @@ _Avoid_: local service name
 
 **Clone**:
 To copy a Service Instance onto another Host: same Service and Instance Name, a new IP, and a copy of its Own Variables, which from then on change independently.
+Cloning a Host creates a new Host, under a new name and with the next Server Index, holding a copy of the source's Own Variables, Group memberships, and Service Instances (same IPs) with their Own Variables.
 
 ### Variables
 

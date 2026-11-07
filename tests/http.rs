@@ -205,6 +205,51 @@ async fn renames_a_host_from_its_rename_page() {
 }
 
 #[tokio::test]
+async fn clones_a_host_from_its_clone_page() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    create_host(&router, "web2").await;
+    post_form(
+        &router,
+        &format!("{host}/variables"),
+        "form=add&name=disk_gb&value=500",
+    )
+    .await;
+    let nginx = create_service(&router, "nginx").await;
+    post_form(
+        &router,
+        &format!("{host}/instances"),
+        &format!("service={}&name=main&ip=192.0.2.10", id_of(&nginx)),
+    )
+    .await;
+    let host_page = text(get(&router, &host).await).await;
+    assert!(
+        host_page.contains(&format!(r#"href="{host}/clone""#)),
+        "{host_page}"
+    );
+
+    let form = text(get(&router, &format!("{host}/clone")).await).await;
+    assert!(form.contains("Clone web1"), "{form}");
+    let rejected = post_form(&router, &format!("{host}/clone"), "name=WEB2").await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("A Host named web2 already exists."), "{page}");
+    assert!(page.contains(r#"value="WEB2""#), "{page}");
+
+    let cloned = post_form(&router, &format!("{host}/clone"), "name=web3").await;
+    assert_eq!(cloned.status(), StatusCode::SEE_OTHER);
+    let clone = location(&cloned);
+    assert_ne!(clone, host);
+    let clone_page = text(get(&router, &clone).await).await;
+    assert!(clone_page.contains("<h1>web3</h1>"), "{clone_page}");
+    assert!(
+        clone_page.contains(r#"<th scope="row">disk_gb</th>"#),
+        "{clone_page}"
+    );
+    assert!(clone_page.contains("192.0.2.10"), "{clone_page}");
+}
+
+#[tokio::test]
 async fn deleting_a_host_goes_through_a_confirmation_listing_its_variables() {
     let (_db, router) = app().await;
     let host = create_host(&router, "web1").await;
