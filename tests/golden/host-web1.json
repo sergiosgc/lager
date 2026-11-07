@@ -1,0 +1,41 @@
+{
+  "ansible_group_priority": 10,
+  "dns": [
+    "192.0.2.53",
+    "2001:db8::53"
+  ],
+  "iscsi_disks": [],
+  "nfs_disks": [],
+  "ntp_server": "ntp.local.example.org",
+  "server_index": 1,
+  "service_instances": {
+    "http": {},
+    "mariadb": {},
+    "nginx": {
+      "main": {
+        "hierarchy": [
+          "nginx",
+          "http"
+        ],
+        "ip": "192.0.2.10",
+        "service": "nginx",
+        "vars": {
+          "port": 8080,
+          "tls": true,
+          "workers": 4
+        }
+      }
+    },
+    "sql": {}
+  },
+  "service_ips": [
+    "192.0.2.10"
+  ],
+  "timezone": "UTC",
+  "upstream": {
+    "nginx_main": [
+      "192.0.2.10",
+      "2001:db8::20"
+    ]
+  }
+}

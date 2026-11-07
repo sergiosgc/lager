@@ -1,0 +1,59 @@
+{
+  "backup": {
+    "enabled": true,
+    "keep_days": 14
+  },
+  "disk_gb": 500,
+  "dns": [
+    "192.0.2.53",
+    "2001:db8::53"
+  ],
+  "iscsi_disks": [],
+  "nfs_disks": [],
+  "ntp_server": "ntp.eu.example.org",
+  "server_index": 10,
+  "service_instances": {
+    "http": {},
+    "mariadb": {
+      "main": {
+        "hierarchy": [
+          "mariadb",
+          "sql"
+        ],
+        "ip": "198.51.100.5",
+        "service": "mariadb",
+        "vars": {
+          "engine": "aria",
+          "port": 3307
+        }
+      },
+      "replica": {
+        "hierarchy": [
+          "mariadb",
+          "sql"
+        ],
+        "ip": "2001:db8::5",
+        "service": "mariadb",
+        "vars": {
+          "engine": "aria",
+          "port": 3306
+        }
+      }
+    },
+    "nginx": {},
+    "sql": {}
+  },
+  "service_ips": [
+    "198.51.100.5",
+    "2001:db8::5"
+  ],
+  "timezone": "Europe/Lisbon",
+  "upstream": {
+    "mariadb_main": [
+      "198.51.100.5"
+    ],
+    "mariadb_replica": [
+      "2001:db8::5"
+    ]
+  }
+}

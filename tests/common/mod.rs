@@ -4,7 +4,9 @@
 
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub fn reference_db() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("database.sqlite")
@@ -68,4 +70,49 @@ pub fn rows_referring_to(db: &TempDb, table: &str, column: &str, id: i64) -> i64
             |r| r.get(0),
         )
         .unwrap()
+}
+
+/// Why `cli/si` can't run here, if it can't: it needs Python 3 with PyYAML.
+pub fn missing_python() -> Option<String> {
+    match Command::new("python3").args(["-c", "import yaml"]).output() {
+        Err(e) => Some(format!("python3 is not available ({e})")),
+        Ok(out) if !out.status.success() => Some(format!(
+            "python3 can't import PyYAML: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// True, after saying so, if `test` must be skipped because `cli/si` can't
+/// run. Writes straight to stderr: the test harness only captures the print
+/// macros, so the message shows even when the test passes.
+pub fn skip_without_python(test: &str) -> bool {
+    let Some(reason) = missing_python() else {
+        return false;
+    };
+    let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
+    true
+}
+
+/// Runs `cli/si --database <database> <args>` and parses its JSON output.
+pub fn run_si(database: &Path, args: &[&str]) -> serde_json::Value {
+    let out = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("cli/si"))
+        .arg("--database")
+        .arg(database)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cli/si {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "cli/si {args:?} printed invalid JSON ({e}):\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
 }

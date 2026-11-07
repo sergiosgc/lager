@@ -5,50 +5,12 @@
 
 mod common;
 
-use std::path::Path;
-use std::process::Command;
-
-use common::{open, temp_db};
+use common::{open, run_si, temp_db};
 use lager::inventory::Owner;
-
-/// Why `cli/si` can't run here, if it can't.
-fn missing_python() -> Option<String> {
-    match Command::new("python3").args(["-c", "import yaml"]).output() {
-        Err(e) => Some(format!("python3 is not available ({e})")),
-        Ok(out) if !out.status.success() => Some(format!(
-            "python3 can't import PyYAML: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
-        Ok(_) => None,
-    }
-}
-
-/// Runs `cli/si --database <database> <args>` and parses its JSON output.
-fn run_si(database: &Path, args: &[&str]) -> serde_json::Value {
-    let out = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("cli/si"))
-        .arg("--database")
-        .arg(database)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "cli/si {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "cli/si {args:?} printed invalid JSON ({e}):\n{}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    })
-}
 
 #[tokio::test]
 async fn lists_a_host_lager_created() {
-    if let Some(reason) = missing_python() {
-        eprintln!("SKIPPED lists_a_host_lager_created: {reason}");
+    if common::skip_without_python("lists_a_host_lager_created") {
         return;
     }
     let db = temp_db();
@@ -64,8 +26,7 @@ async fn lists_a_host_lager_created() {
 
 #[tokio::test]
 async fn returns_the_host_variables_lager_set() {
-    if let Some(reason) = missing_python() {
-        eprintln!("SKIPPED returns_the_host_variables_lager_set: {reason}");
+    if common::skip_without_python("returns_the_host_variables_lager_set") {
         return;
     }
     let db = temp_db();
@@ -121,8 +82,7 @@ async fn returns_the_host_variables_lager_set() {
 
 #[tokio::test]
 async fn lists_the_groups_lager_wrote_with_hosts_and_children() {
-    if let Some(reason) = missing_python() {
-        eprintln!("SKIPPED lists_the_groups_lager_wrote_with_hosts_and_children: {reason}");
+    if common::skip_without_python("lists_the_groups_lager_wrote_with_hosts_and_children") {
         return;
     }
     let db = temp_db();
@@ -176,8 +136,7 @@ async fn lists_the_groups_lager_wrote_with_hosts_and_children() {
 
 #[tokio::test]
 async fn lists_the_group_variables_lager_set() {
-    if let Some(reason) = missing_python() {
-        eprintln!("SKIPPED lists_the_group_variables_lager_set: {reason}");
+    if common::skip_without_python("lists_the_group_variables_lager_set") {
         return;
     }
     let db = temp_db();
@@ -224,10 +183,9 @@ async fn lists_the_group_variables_lager_set() {
 
 #[tokio::test]
 async fn shows_the_service_instances_lager_wrote_with_hierarchy_and_vars() {
-    if let Some(reason) = missing_python() {
-        eprintln!(
-            "SKIPPED shows_the_service_instances_lager_wrote_with_hierarchy_and_vars: {reason}"
-        );
+    if common::skip_without_python(
+        "shows_the_service_instances_lager_wrote_with_hierarchy_and_vars",
+    ) {
         return;
     }
     let db = temp_db();

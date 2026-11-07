@@ -1,0 +1,195 @@
+{
+  "_meta": {
+    "hostvars": {
+      "db1": {
+        "disk_gb": 500,
+        "iscsi_disks": [],
+        "nfs_disks": [],
+        "server_index": 10,
+        "service_instances": {
+          "http": {},
+          "mariadb": {
+            "main": {
+              "hierarchy": [
+                "mariadb",
+                "sql"
+              ],
+              "ip": "198.51.100.5",
+              "service": "mariadb",
+              "vars": {
+                "engine": "aria",
+                "port": 3307
+              }
+            },
+            "replica": {
+              "hierarchy": [
+                "mariadb",
+                "sql"
+              ],
+              "ip": "2001:db8::5",
+              "service": "mariadb",
+              "vars": {
+                "engine": "aria",
+                "port": 3306
+              }
+            }
+          },
+          "nginx": {},
+          "sql": {}
+        },
+        "service_ips": [
+          "198.51.100.5",
+          "2001:db8::5"
+        ]
+      },
+      "web1": {
+        "iscsi_disks": [],
+        "nfs_disks": [],
+        "ntp_server": "ntp.local.example.org",
+        "server_index": 1,
+        "service_instances": {
+          "http": {},
+          "mariadb": {},
+          "nginx": {
+            "main": {
+              "hierarchy": [
+                "nginx",
+                "http"
+              ],
+              "ip": "192.0.2.10",
+              "service": "nginx",
+              "vars": {
+                "port": 8080,
+                "tls": true,
+                "workers": 4
+              }
+            }
+          },
+          "sql": {}
+        },
+        "service_ips": [
+          "192.0.2.10"
+        ]
+      },
+      "web2": {
+        "iscsi_disks": [],
+        "nfs_disks": [],
+        "server_index": 2,
+        "service_instances": {
+          "http": {},
+          "mariadb": {},
+          "nginx": {
+            "main": {
+              "hierarchy": [
+                "nginx",
+                "http"
+              ],
+              "ip": "2001:db8::20",
+              "service": "nginx",
+              "vars": {
+                "port": 8080,
+                "tls": true,
+                "workers": 8
+              }
+            }
+          },
+          "sql": {}
+        },
+        "service_ips": [
+          "2001:db8::20"
+        ]
+      }
+    }
+  },
+  "all_sites": {
+    "children": [
+      "eu",
+      "us"
+    ],
+    "hosts": [],
+    "vars": {
+      "dns": [
+        "192.0.2.53",
+        "2001:db8::53"
+      ],
+      "ntp_server": "ntp.example.org",
+      "upstream": {
+        "mariadb_main": [
+          "198.51.100.5"
+        ],
+        "mariadb_replica": [
+          "2001:db8::5"
+        ],
+        "nginx_main": [
+          "192.0.2.10",
+          "2001:db8::20"
+        ]
+      }
+    }
+  },
+  "db": {
+    "children": [],
+    "hosts": [
+      "db1"
+    ],
+    "vars": {
+      "backup": {
+        "enabled": true,
+        "keep_days": 14
+      },
+      "upstream": {
+        "mariadb_main": [
+          "198.51.100.5"
+        ],
+        "mariadb_replica": [
+          "2001:db8::5"
+        ]
+      }
+    }
+  },
+  "eu": {
+    "children": [
+      "lisbon"
+    ],
+    "hosts": [
+      "db1"
+    ],
+    "vars": {
+      "ntp_server": "ntp.eu.example.org",
+      "timezone": "Europe/Lisbon"
+    }
+  },
+  "lisbon": {
+    "children": [],
+    "hosts": [
+      "web1"
+    ],
+    "vars": {}
+  },
+  "us": {
+    "children": [],
+    "hosts": [
+      "web2"
+    ],
+    "vars": {
+      "timezone": "America/New_York"
+    }
+  },
+  "web": {
+    "children": [],
+    "hosts": [
+      "web1",
+      "web2"
+    ],
+    "vars": {
+      "ansible_group_priority": 10,
+      "timezone": "UTC",
+      "upstream": {
+        "nginx_main": [
+          "192.0.2.10",
+          "2001:db8::20"
+        ]
+      }
+    }
+  }
+}
