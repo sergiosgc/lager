@@ -21,9 +21,9 @@ use super::variables::{
     FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
     own_variables_section, removed_variables_section,
 };
-use super::{inventory, page_error};
+use super::{FieldError, inventory, page_error};
 use crate::inventory::{
-    EffectiveVariable, OwnVariable, Owner, ServiceInstance, ServiceInstanceDeletion,
+    EffectiveVariable, Host, OwnVariable, Owner, ServiceInstance, ServiceInstanceDeletion,
 };
 
 topcoat::router::path_param!(pub(super) instance_id: i64, error = not_found);
@@ -41,8 +41,7 @@ pub(super) struct InstanceFields {
 pub(super) struct FailedInstance {
     pub(super) choice: Option<i64>,
     pub(super) fields: InstanceFields,
-    pub(super) field: &'static str,
-    pub(super) message: String,
+    pub(super) error: FieldError,
 }
 
 /// The form adding a Service Instance. `choice_name` is the field choosing
@@ -60,12 +59,7 @@ pub(super) async fn add_instance_form(
     let (name, ip) = failed.as_ref().map_or((String::new(), String::new()), |f| {
         (f.fields.name.clone(), f.fields.ip.clone())
     });
-    let error_for = |field: &str| {
-        failed
-            .as_ref()
-            .filter(|f| f.field == field)
-            .map(|f| f.message.clone())
-    };
+    let error_for = |field: &str| failed.as_ref().and_then(|f| f.error.on(field));
     let (name_error, ip_error) = (error_for("name"), error_for("ip"));
     Ok(view! {
         <h3>"Add a Service Instance"</h3>
@@ -144,8 +138,12 @@ pub(super) async fn host_instances_list(instances: Vec<ServiceInstance>) -> Resu
                     #[key(instance.id)]
                     for instance in list {
                         <li>
-                            <a href=(href!(instance_detail, InstanceId(instance.id)))>(instance.name)</a>
-                            " at " <code>(instance.ip)</code>
+                            <a href=(href!(instance_detail, InstanceId(instance.id)))>(instance.name.clone())</a>
+                            " at " <code>(instance.ip.clone())</code>
+                            " · "
+                            <a href=(href!(clone_instance_form, InstanceId(instance.id)))
+                                aria-label=(format!("Clone {}", instance.label()))
+                            >"Clone…"</a>
                         </li>
                     }
                 </ul>
@@ -273,8 +271,7 @@ pub(super) async fn update_instance(
             let edit = FailedInstance {
                 choice: None,
                 fields: input,
-                field,
-                message,
+                error: FieldError { field, message },
             };
             Ok(view! { instance_view(page: page, edit: Some(edit), failed: None) })
         }
@@ -343,11 +340,7 @@ async fn instance_view(
         .map_or((instance.name.clone(), instance.ip.clone()), |e| {
             (e.fields.name.clone(), e.fields.ip.clone())
         });
-    let error_for = |field: &str| {
-        edit.as_ref()
-            .filter(|e| e.field == field)
-            .map(|e| e.message.clone())
-    };
+    let error_for = |field: &str| edit.as_ref().and_then(|e| e.error.on(field));
     let (name_error, ip_error) = (error_for("name"), error_for("ip"));
     Ok(view! {
         if edit.is_some() || failed.is_some() {
@@ -448,4 +441,123 @@ pub(super) async fn delete_instance(cx: &Cx) -> Result<impl View> {
         href!(super::hosts::hosts_list).resolve(cx)
     };
     Err::<(), _>(see_other(back).into())
+}
+
+#[derive(Deserialize)]
+pub(super) struct CloneInput {
+    host: i64,
+    ip: String,
+}
+
+/// A rejected clone: the target Host and IP as submitted, and which field
+/// was wrong and why.
+pub(super) struct FailedClone {
+    host: i64,
+    ip: String,
+    error: FieldError,
+}
+
+#[page("/instances/{instance_id}/clone")]
+pub(super) async fn clone_instance_form(cx: &Cx) -> Result<impl View> {
+    let instance = path_instance(cx).await?;
+    let hosts = clone_targets(cx, &instance).await?;
+    Ok(view! { clone_view(instance: instance, hosts: hosts, failed: None) })
+}
+
+#[page(POST "/instances/{instance_id}/clone")]
+pub(super) async fn clone_instance(cx: &Cx, Form(input): Form<CloneInput>) -> Result<impl View> {
+    let instance = path_instance(cx).await?;
+    match inventory(cx)
+        .clone_service_instance(instance.id, input.host, &input.ip)
+        .await
+    {
+        Ok(done) => {
+            Err(see_other(href!(instance_detail, InstanceId(done.value.id)).resolve(cx)).into())
+        }
+        Err(crate::inventory::Error::Invalid { field, message }) => {
+            let hosts = clone_targets(cx, &instance).await?;
+            let failed = FailedClone {
+                host: input.host,
+                ip: input.ip,
+                error: FieldError { field, message },
+            };
+            Ok(view! { clone_view(instance: instance, hosts: hosts, failed: Some(failed)) })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+/// The Hosts a Service Instance can be cloned onto: every Host but its own
+/// (where its Instance Name is necessarily taken).
+async fn clone_targets(cx: &Cx, instance: &ServiceInstance) -> Result<Vec<Host>> {
+    Ok(inventory(cx)
+        .hosts()
+        .await?
+        .into_iter()
+        .filter(|h| h.id != instance.host_id)
+        .collect())
+}
+
+/// The clone form: the target Host and the clone's IP. The Service,
+/// Instance Name and Own Variables come from `instance`.
+#[component]
+async fn clone_view(
+    instance: ServiceInstance,
+    hosts: Vec<Host>,
+    failed: Option<FailedClone>,
+) -> Result<impl View> {
+    let chosen = failed.as_ref().map(|f| f.host);
+    let ip = failed.as_ref().map_or(String::new(), |f| f.ip.clone());
+    let error_for = |field: &str| failed.as_ref().and_then(|f| f.error.on(field));
+    let (host_error, ip_error) = (error_for("host"), error_for("ip"));
+    let id = instance.id;
+    Ok(view! {
+        if failed.is_some() {
+            (StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        <h1>"Clone " (instance.label())</h1>
+        <p>
+            "The clone runs " (instance.service_name.clone()) " as " <strong>(instance.name.clone())</strong>
+            " on the Host you pick, at a new IP, with a copy of this Service Instance's Own Variables."
+        </p>
+        if hosts.is_empty() {
+            <p>"There is no other Host to clone it onto. Create a Host first."</p>
+        } else {
+        <form method="post" action=(href!(clone_instance, InstanceId(id)))>
+            <label for="host">"Target Host"</label>
+            <select id="host" name="host"
+                if host_error.is_some() {
+                    aria-invalid="true"
+                    aria-describedby="host-error"
+                }
+            >
+                #[key(host.id)]
+                for host in hosts {
+                    <option value=(host.id)
+                        if chosen == Some(host.id) {
+                            selected=(true)
+                        }
+                    >(host.name)</option>
+                }
+            </select>
+            if let Some(error) = host_error {
+                <p id="host-error" class="error">(error)</p>
+            }
+            <label for="ip">"IP"</label>
+            <input id="ip" name="ip" value=(ip) required=(true)
+                if ip_error.is_some() {
+                    aria-invalid="true"
+                    aria-describedby="ip-error"
+                }
+            >
+            if let Some(error) = ip_error {
+                <p id="ip-error" class="error">(error)</p>
+            }
+            <p class="actions">
+                <button type="submit">"Clone"</button>
+                <a href=(href!(instance_detail, InstanceId(id)))>"Cancel"</a>
+            </p>
+        </form>
+        }
+    })
 }

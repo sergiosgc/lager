@@ -37,6 +37,9 @@ _Avoid_: deployment, local service
 The name distinguishing Service Instances of the same Service on the same Host (e.g. two `postgresql` clusters on one Host).
 _Avoid_: local service name
 
+**Clone**:
+To copy a Service Instance onto another Host: same Service and Instance Name, a new IP, and a copy of its Own Variables, which from then on change independently.
+
 ### Variables
 
 **Variable**:

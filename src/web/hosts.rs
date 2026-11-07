@@ -88,12 +88,7 @@ async fn new_host_view(
     server_index: String,
     error: Option<FieldError>,
 ) -> Result<impl View> {
-    let field_error = |field: &str| {
-        error
-            .as_ref()
-            .filter(|e| e.field == field)
-            .map(|e| e.message.clone())
-    };
+    let field_error = |field: &str| error.as_ref().and_then(|e| e.on(field));
     let (name_error, index_error) = (field_error("name"), field_error(inventory::SERVER_INDEX));
     Ok(view! {
         if error.is_some() {
@@ -251,8 +246,7 @@ pub(super) async fn add_host_instance(
             let failed_instance = FailedInstance {
                 choice: Some(input.service),
                 fields: input.fields,
-                field,
-                message,
+                error: FieldError { field, message },
             };
             Ok(
                 view! { host_view(page: page, failed: None, failed_instance: Some(failed_instance)) },

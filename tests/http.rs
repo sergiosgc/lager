@@ -585,3 +585,69 @@ async fn a_service_instance_whose_host_is_gone_can_still_be_deleted() {
     assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&deleted), format!("{nginx}#instances"));
 }
+
+#[tokio::test]
+async fn clones_a_service_instance_from_the_host_page() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let web2 = create_host(&router, "web2").await;
+    let nginx = create_service(&router, "nginx").await;
+    post_form(
+        &router,
+        &format!("{host}/instances"),
+        &format!("service={}&name=main&ip=192.0.2.10", id_of(&nginx)),
+    )
+    .await;
+    let host_page = text(get(&router, &host).await).await;
+    let start = host_page.find(r#"href="/instances/"#).unwrap() + r#"href=""#.len();
+    let instance = host_page[start..].split('"').next().unwrap().to_string();
+    assert!(
+        host_page.contains(&format!(r#"href="{instance}/clone""#)),
+        "{host_page}"
+    );
+    post_form(
+        &router,
+        &format!("{instance}/variables"),
+        "form=add&name=workers&value=4",
+    )
+    .await;
+
+    let form = text(get(&router, &format!("{instance}/clone")).await).await;
+    assert!(form.contains(">web2<"), "{form}");
+    let rejected = post_form(
+        &router,
+        &format!("{instance}/clone"),
+        &format!("host={}&ip=not-an-ip", id_of(&web2)),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(rejected).await.contains(r#"value="not-an-ip""#));
+
+    let cloned = post_form(
+        &router,
+        &format!("{instance}/clone"),
+        &format!("host={}&ip=192.0.2.20", id_of(&web2)),
+    )
+    .await;
+    assert_eq!(cloned.status(), StatusCode::SEE_OTHER);
+    let clone_page = text(get(&router, &location(&cloned)).await).await;
+    assert!(clone_page.contains("nginx main on web2"), "{clone_page}");
+    assert!(clone_page.contains(r#"value="192.0.2.20""#), "{clone_page}");
+    assert!(
+        clone_page.contains(r#"<th scope="row">workers</th>"#),
+        "{clone_page}"
+    );
+
+    let again = post_form(
+        &router,
+        &format!("{instance}/clone"),
+        &format!("host={}&ip=192.0.2.21", id_of(&web2)),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        text(again)
+            .await
+            .contains("web2 already has a Service Instance of nginx named main")
+    );
+}

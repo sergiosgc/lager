@@ -74,6 +74,8 @@ pub fn router(inventory: Inventory) -> Router {
         .page(service_instances::remove_instance_variable)
         .page(service_instances::delete_instance_confirmation)
         .page(service_instances::delete_instance)
+        .page(service_instances::clone_instance_form)
+        .page(service_instances::clone_instance)
         .build()
 }
 
@@ -133,6 +135,13 @@ async fn home(cx: &Cx) -> Result<SeeOther> {
 pub(crate) struct FieldError {
     pub(crate) field: &'static str,
     pub(crate) message: String,
+}
+
+impl FieldError {
+    /// The message, if this error is about `field`.
+    pub(crate) fn on(&self, field: &str) -> Option<String> {
+        (self.field == field).then(|| self.message.clone())
+    }
 }
 
 /// Turns an Inventory error a page can't show in a form into a response:

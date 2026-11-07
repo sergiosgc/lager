@@ -395,3 +395,189 @@ async fn lists_service_instances_whose_service_no_longer_exists() {
         0
     );
 }
+
+// Cloning
+
+#[tokio::test]
+async fn cloning_copies_the_instance_onto_another_host_with_a_new_ip_and_its_variables() {
+    let (_h, f) = fixture().await;
+    let main = add(&f, &f.web1, "main", "192.0.2.10").await;
+    let source = Owner::ServiceInstance(main.id);
+    f.inventory
+        .set_variable(source, "workers", "4")
+        .await
+        .unwrap();
+    f.inventory
+        .set_variable(source, "tls", r#"{"enabled": true}"#)
+        .await
+        .unwrap();
+
+    let clone = f
+        .inventory
+        .clone_service_instance(main.id, f.web2.id, "2001:db8::20")
+        .await
+        .unwrap()
+        .value;
+
+    assert_ne!(clone.id, main.id);
+    assert_eq!(
+        (
+            clone.service_id,
+            clone.name.as_str(),
+            clone.host_id,
+            clone.ip.as_str()
+        ),
+        (f.nginx.id, "main", f.web2.id, "2001:db8::20")
+    );
+    assert_eq!(
+        f.inventory
+            .own_variables(Owner::ServiceInstance(clone.id))
+            .await
+            .unwrap(),
+        [own("tls", r#"{"enabled": true}"#), own("workers", "4")]
+    );
+}
+
+#[tokio::test]
+async fn a_clones_variables_are_independent_of_the_source() {
+    let (_h, f) = fixture().await;
+    let main = add(&f, &f.web1, "main", "192.0.2.10").await;
+    let source = Owner::ServiceInstance(main.id);
+    f.inventory
+        .set_variable(source, "workers", "4")
+        .await
+        .unwrap();
+    f.inventory
+        .set_variable(source, "tls", "true")
+        .await
+        .unwrap();
+    let clone = f
+        .inventory
+        .clone_service_instance(main.id, f.web2.id, "192.0.2.20")
+        .await
+        .unwrap()
+        .value;
+    let cloned = Owner::ServiceInstance(clone.id);
+
+    f.inventory
+        .set_variable(cloned, "workers", "8")
+        .await
+        .unwrap();
+    f.inventory.remove_variable(source, "tls").await.unwrap();
+    f.inventory
+        .set_variable(source, "backlog", "511")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.inventory.own_variables(source).await.unwrap(),
+        [own("backlog", "511"), own("workers", "4")]
+    );
+    assert_eq!(
+        f.inventory.own_variables(cloned).await.unwrap(),
+        [own("tls", "true"), own("workers", "8")]
+    );
+}
+
+#[tokio::test]
+async fn cloning_onto_a_host_that_already_has_the_instance_is_refused() {
+    let (_h, f) = fixture().await;
+    let main = add(&f, &f.web1, "main", "192.0.2.10").await;
+    add(&f, &f.web2, "main", "192.0.2.20").await;
+
+    let onto_other = f
+        .inventory
+        .clone_service_instance(main.id, f.web2.id, "192.0.2.21")
+        .await
+        .unwrap_err();
+    let onto_itself = f
+        .inventory
+        .clone_service_instance(main.id, f.web1.id, "192.0.2.11")
+        .await
+        .unwrap_err();
+
+    assert_invalid(
+        onto_other,
+        "host",
+        "web2 already has a Service Instance of nginx named main",
+    );
+    assert_invalid(onto_itself, "host", "web1 already has");
+    assert_eq!(
+        f.inventory
+            .instances_of_service(f.nginx.id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn cloning_checks_the_ip_and_that_both_ends_exist() {
+    let (_h, f) = fixture().await;
+    let main = add(&f, &f.web1, "main", "192.0.2.10").await;
+
+    let bad_ip = f
+        .inventory
+        .clone_service_instance(main.id, f.web2.id, "999.0.2.1")
+        .await
+        .unwrap_err();
+    assert_invalid(bad_ip, "ip", "IP");
+    for err in [
+        f.inventory
+            .clone_service_instance(999, f.web2.id, "192.0.2.1")
+            .await
+            .unwrap_err(),
+        f.inventory
+            .clone_service_instance(main.id, 999, "192.0.2.1")
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+    assert!(
+        f.inventory
+            .instances_on_host(f.web2.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cloning_copies_values_as_stored_and_needs_the_source_service() {
+    let (h, f) = fixture().await;
+    let main = add(&f, &f.web1, "main", "192.0.2.10").await;
+    // A value whose Variable name row is gone, as cli/si can leave behind;
+    // cli/si's clone copies it too.
+    sql(
+        &h,
+        &format!(
+            "INSERT INTO service_instance_variable(variable, instance, value) VALUES (998, {}, '1')",
+            main.id
+        ),
+    );
+    let clone = f
+        .inventory
+        .clone_service_instance(main.id, f.web2.id, "192.0.2.20")
+        .await
+        .unwrap()
+        .value;
+    assert_eq!(
+        rows_referring_to(&h, "service_instance_variable", "instance", clone.id),
+        1
+    );
+
+    // An orphaned Service Instance (its Service gone) can't be cloned.
+    sql(
+        &h,
+        &format!("DELETE FROM service WHERE id = {}", f.nginx.id),
+    );
+    let web3 = f.inventory.create_host("web3", None).await.unwrap().value;
+    let err = f
+        .inventory
+        .clone_service_instance(main.id, web3.id, "192.0.2.21")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}

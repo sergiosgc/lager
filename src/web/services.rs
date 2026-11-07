@@ -23,7 +23,7 @@ use super::variables::{
     FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
     own_variables_section, removed_variables_section,
 };
-use super::{inventory, page_error};
+use super::{FieldError, inventory, page_error};
 use crate::inventory::{
     EffectiveVariable, Host, OwnVariable, Owner, Service, ServiceDeletion, ServiceInstance,
 };
@@ -243,8 +243,7 @@ pub(super) async fn add_service_instance(
             let failed_instance = FailedInstance {
                 choice: Some(input.host),
                 fields: input.fields,
-                field,
-                message,
+                error: FieldError { field, message },
             };
             Ok(view! {
                 service_view(page: page, parent_error: None, failed: None, failed_instance: Some(failed_instance))

@@ -492,6 +492,29 @@ pub(super) async fn write_variable(
                 .id
         }
     };
+    upsert_value(tx, owner, variable_id, value).await
+}
+
+/// Copies every Own Variable value of `from` onto `to`, as stored (values
+/// whose Variable name is missing included, as `cli/si` copies them).
+pub(super) async fn copy_owner_values(
+    tx: &mut toasty::Transaction<'_>,
+    from: Owner,
+    to: Owner,
+) -> Result<(), Error> {
+    for (variable_id, value) in owner_values(&mut *tx, from).await? {
+        upsert_value(&mut *tx, to, variable_id, &value).await?;
+    }
+    Ok(())
+}
+
+/// Sets an entity's value of the Variable with this id.
+async fn upsert_value(
+    tx: &mut toasty::Transaction<'_>,
+    owner: Owner,
+    variable_id: i64,
+    value: &str,
+) -> Result<(), Error> {
     let (table, column) = owner.value_table();
     let id = owner.id();
     // Each value table's primary key is (variable, entity) (ADR 0003).

@@ -81,7 +81,7 @@ impl Inventory {
         let mut tx = db.transaction().await?;
         existing_host(&mut tx, host_id).await?;
         existing_service(&mut tx, service_id).await?;
-        unused_identity(&mut tx, service_id, host_id, name, None).await?;
+        unused_identity(&mut tx, "name", service_id, host_id, name, None).await?;
         let row = models::ServiceInstance::create()
             .service_id(service_id)
             .host_id(host_id)
@@ -107,11 +107,57 @@ impl Inventory {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let mut row = existing_instance(&mut tx, id).await?;
-        unused_identity(&mut tx, row.service_id, row.host_id, name, Some(id)).await?;
+        unused_identity(&mut tx, "name", row.service_id, row.host_id, name, Some(id)).await?;
         row.update().name(name).ip(ip).exec(&mut tx).await?;
         let instance = describe(&mut tx, vec![row]).await?.remove(0);
         tx.commit().await?;
         Ok(Done::ok(instance))
+    }
+
+    /// Clones a Service Instance onto another Host, as `cli/si`'s
+    /// `service_instance clone` does: same Service and Instance Name, the
+    /// given IP, and a copy of the source's Own Variables, which from then
+    /// on change independently. Refused if the target Host already has
+    /// that Service with that Instance Name.
+    pub async fn clone_service_instance(
+        &self,
+        source_id: i64,
+        target_host_id: i64,
+        ip: &str,
+    ) -> Result<Done<ServiceInstance>, Error> {
+        let ip = valid_ip(ip)?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        let source = existing_instance(&mut tx, source_id).await?;
+        // An orphaned Service Instance (its Service gone) isn't cloned, as
+        // cli/si's clone inserts nothing then.
+        existing_service(&mut tx, source.service_id).await?;
+        existing_host(&mut tx, target_host_id).await?;
+        unused_identity(
+            &mut tx,
+            "host",
+            source.service_id,
+            target_host_id,
+            &source.name,
+            None,
+        )
+        .await?;
+        let row = models::ServiceInstance::create()
+            .service_id(source.service_id)
+            .host_id(target_host_id)
+            .name(source.name.clone())
+            .ip(ip)
+            .exec(&mut tx)
+            .await?;
+        copy_owner_values(
+            &mut tx,
+            Owner::ServiceInstance(source_id),
+            Owner::ServiceInstance(row.id),
+        )
+        .await?;
+        let clone = describe(&mut tx, vec![row]).await?.remove(0);
+        tx.commit().await?;
+        Ok(Done::ok(clone))
     }
 
     /// What deleting a Service Instance would remove.
@@ -290,9 +336,10 @@ fn valid_ip(ip: &str) -> Result<&str, Error> {
 }
 
 /// Fails if another Service Instance (other than `except`) of this Service
-/// on this Host already has this Instance Name.
+/// on this Host already has this Instance Name, blaming the input `field`.
 async fn unused_identity(
     db: &mut impl toasty::Executor,
+    field: &'static str,
     service_id: i64,
     host_id: i64,
     name: &str,
@@ -322,7 +369,7 @@ async fn unused_identity(
             .await?
             .map_or(format!("Host {host_id}"), |h| h.name);
         return Err(invalid(
-            "name",
+            field,
             format!("{host} already has a Service Instance of {service} named {name}."),
         ));
     }
