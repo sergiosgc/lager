@@ -184,6 +184,10 @@ pub struct DbVersion {
 /// per-connection, so the pool is pinned to one connection that is never
 /// recycled (lifetime and idle caps default to none), and the pragma is set
 /// once on it.
+///
+/// TEMPORARY: replace with the driver's `.foreign_keys(false)` once a
+/// published Toasty release has it. See
+/// https://github.com/sergiosgc/lager/issues/17
 pub async fn open(path: &std::path::Path) -> toasty::Result<toasty::Db> {
     let driver = toasty_driver_sqlite::Sqlite::open(path);
     let mut db = toasty::Db::builder()
