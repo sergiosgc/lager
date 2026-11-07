@@ -671,6 +671,12 @@ async fn clones_a_service_instance_from_the_host_page() {
     )
     .await;
 
+    let instance_page = text(get(&router, &instance).await).await;
+    assert!(
+        instance_page.contains(&format!(r#"href="{instance}/clone""#)),
+        "{instance_page}"
+    );
+
     let form = text(get(&router, &format!("{instance}/clone")).await).await;
     assert!(form.contains(">web2<"), "{form}");
     let rejected = post_form(

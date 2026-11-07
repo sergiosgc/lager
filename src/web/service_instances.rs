@@ -363,6 +363,11 @@ async fn instance_view(
             "."
         </p>
         <p class="actions">
+            // An instance of a missing Service can't be cloned (cli/si's
+            // clone inserts nothing then).
+            if instance.service_exists {
+                <a href=(href!(clone_instance_form, InstanceId(id)))>"Clone…"</a>
+            }
             <a href=(href!(delete_instance_confirmation, InstanceId(id)))>"Delete…"</a>
         </p>
 
