@@ -15,12 +15,18 @@ use topcoat::{
     view::{View, component, view},
 };
 
+use super::service_instances::{
+    FailedInstance, InstanceFields, add_instance_form, removed_instances_section,
+    service_instances_list,
+};
 use super::variables::{
     FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
     own_variables_section, removed_variables_section,
 };
 use super::{inventory, page_error};
-use crate::inventory::{EffectiveVariable, OwnVariable, Owner, Service, ServiceDeletion};
+use crate::inventory::{
+    EffectiveVariable, Host, OwnVariable, Owner, Service, ServiceDeletion, ServiceInstance,
+};
 
 topcoat::router::path_param!(pub(super) service_id: i64, error = not_found);
 
@@ -33,6 +39,9 @@ pub(super) struct ServicePage {
     children: Vec<Service>,
     variables: Vec<OwnVariable>,
     effective: Vec<EffectiveVariable>,
+    instances: Vec<ServiceInstance>,
+    /// Every Host, for adding a Service Instance.
+    hosts: Vec<Host>,
 }
 
 async fn load_service_page(cx: &Cx, service: Service) -> Result<ServicePage> {
@@ -45,6 +54,8 @@ async fn load_service_page(cx: &Cx, service: Service) -> Result<ServicePage> {
     Ok(ServicePage {
         other_services: all.into_iter().filter(|s| s.id != service.id).collect(),
         children: inventory.child_services(service.id).await?,
+        instances: inventory.instances_of_service(service.id).await?,
+        hosts: inventory.hosts().await?,
         variables: inventory.own_variables(Owner::Service(service.id)).await?,
         effective: inventory
             .effective_variables(Owner::Service(service.id))
@@ -179,7 +190,7 @@ async fn service_name_view(
 pub(super) async fn service_detail(cx: &Cx) -> Result<impl View> {
     let service = path_service(cx).await?;
     let page = load_service_page(cx, service).await?;
-    Ok(view! { service_view(page: page, parent_error: None, failed: None) })
+    Ok(view! { service_view(page: page, parent_error: None, failed: None, failed_instance: None) })
 }
 
 #[derive(Deserialize)]
@@ -201,7 +212,43 @@ pub(super) async fn set_service_parent(
         Ok(_) => Err(see_other(service_url(cx, service.id, "parent")).into()),
         Err(crate::inventory::Error::Invalid { message, .. }) => {
             let page = load_service_page(cx, service).await?;
-            Ok(view! { service_view(page: page, parent_error: Some(message), failed: None) })
+            Ok(view! {
+                service_view(page: page, parent_error: Some(message), failed: None, failed_instance: None)
+            })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct ServiceInstanceInput {
+    host: i64,
+    #[serde(flatten)]
+    fields: InstanceFields,
+}
+
+#[page(POST "/services/{service_id}/instances")]
+pub(super) async fn add_service_instance(
+    cx: &Cx,
+    Form(input): Form<ServiceInstanceInput>,
+) -> Result<impl View> {
+    let service = path_service(cx).await?;
+    match inventory(cx)
+        .create_service_instance(input.host, service.id, &input.fields.name, &input.fields.ip)
+        .await
+    {
+        Ok(_) => Err(see_other(service_url(cx, service.id, "instances")).into()),
+        Err(crate::inventory::Error::Invalid { field, message }) => {
+            let page = load_service_page(cx, service).await?;
+            let failed_instance = FailedInstance {
+                choice: Some(input.host),
+                fields: input.fields,
+                field,
+                message,
+            };
+            Ok(view! {
+                service_view(page: page, parent_error: None, failed: None, failed_instance: Some(failed_instance))
+            })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -225,7 +272,9 @@ pub(super) async fn set_service_variable(
                 field,
                 message,
             };
-            Ok(view! { service_view(page: page, parent_error: None, failed: Some(failed)) })
+            Ok(view! {
+                service_view(page: page, parent_error: None, failed: Some(failed), failed_instance: None)
+            })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -252,6 +301,7 @@ async fn service_view(
     page: ServicePage,
     parent_error: Option<String>,
     failed: Option<FailedVariable>,
+    failed_instance: Option<FailedInstance>,
 ) -> Result<impl View> {
     let ServicePage {
         service,
@@ -260,10 +310,12 @@ async fn service_view(
         children,
         variables,
         effective,
+        instances,
+        hosts,
     } = page;
     let service_id = service.id;
     Ok(view! {
-        if parent_error.is_some() || failed.is_some() {
+        if parent_error.is_some() || failed.is_some() || failed_instance.is_some() {
             (StatusCode::UNPROCESSABLE_ENTITY)
         }
         <p><a href=(href!(services_list))>"All Services"</a></p>
@@ -320,6 +372,16 @@ async fn service_view(
             </ul>
         }
 
+        <h2 id="instances">"Service Instances"</h2>
+        service_instances_list(instances: instances)
+        add_instance_form(
+            action: href!(add_service_instance, ServiceId(service_id)).resolve(cx),
+            choice_name: "host",
+            choice_label: "Host",
+            choices: hosts.into_iter().map(|h| (h.id, h.name)).collect(),
+            failed: failed_instance,
+        )
+
         own_variables_section(
             set_url: href!(set_service_variable, ServiceId(service_id)).resolve(cx),
             remove_url: href!(remove_service_variable, ServiceId(service_id)).resolve(cx),
@@ -338,75 +400,49 @@ pub(super) async fn delete_service_confirmation(cx: &Cx) -> Result<impl View> {
         .service_deletion(id)
         .await
         .map_err(page_error)?;
-    Ok(view! { delete_service_view(deletion: deletion, refused: false) })
+    Ok(view! { delete_service_view(deletion: deletion) })
 }
 
 #[page(POST "/services/{service_id}/delete")]
 pub(super) async fn delete_service(cx: &Cx) -> Result<impl View> {
     let id = *path_param::<ServiceId>(cx)?;
-    match inventory(cx).delete_service(id).await {
-        Ok(_) => Err(see_other(href!(services_list).resolve(cx)).into()),
-        // Something blocks the delete: show the confirmation page again,
-        // which says what.
-        Err(crate::inventory::Error::Invalid { .. }) => {
-            let deletion = inventory(cx)
-                .service_deletion(id)
-                .await
-                .map_err(page_error)?;
-            Ok(view! { delete_service_view(deletion: deletion, refused: true) })
-        }
-        Err(e) => Err(page_error(e)),
-    }
+    inventory(cx).delete_service(id).await.map_err(page_error)?;
+    Err::<(), _>(see_other(href!(services_list).resolve(cx)).into())
 }
 
-/// The delete confirmation: what changes, or why the Service can't be
-/// deleted yet. `refused` marks a delete that was attempted and blocked.
+/// The delete confirmation: everything that will be removed or changed.
 #[component]
-async fn delete_service_view(deletion: ServiceDeletion, refused: bool) -> Result<impl View> {
+async fn delete_service_view(deletion: ServiceDeletion) -> Result<impl View> {
     let ServiceDeletion {
         service,
         own_variables,
         child_services,
-        blockers,
+        service_instances,
     } = deletion;
     let service_id = service.id;
     let name = service.name;
     Ok(view! {
-        if refused {
-            (StatusCode::CONFLICT)
-        }
         <h1>"Delete " (name.clone())</h1>
-        if !blockers.is_empty() {
-            <div class="error" role="alert">
-                <p>(name.clone()) " can't be deleted yet."</p>
-                <ul>
-                    for blocker in blockers {
-                        <li>(blocker)</li>
-                    }
-                </ul>
-            </div>
-            <p><a href=(href!(service_detail, ServiceId(service_id)))>"Back to " (name)</a></p>
+        <p>"This removes the Service " <strong>(name.clone())</strong> "."</p>
+        removed_variables_section(variables: own_variables)
+        removed_instances_section(instances: service_instances)
+        <h2>"Child Services becoming top-level"</h2>
+        if child_services.is_empty() {
+            <p>"None: no Service specialises it."</p>
         } else {
-            <p>"This removes the Service " <strong>(name.clone())</strong> "."</p>
-            removed_variables_section(variables: own_variables)
-            <h2>"Child Services becoming top-level"</h2>
-            if child_services.is_empty() {
-                <p>"None: no Service specialises it."</p>
-            } else {
-                <p class="hint">"These Services stay, without a Parent Service."</p>
-                <ul>
-                    #[key(child.id)]
-                    for child in child_services {
-                        <li>(child.name)</li>
-                    }
-                </ul>
-            }
-            <form method="post" action=(href!(delete_service, ServiceId(service_id)))>
-                <p class="actions">
-                    <button type="submit" class="danger">"Delete " (name.clone())</button>
-                    <a href=(href!(service_detail, ServiceId(service_id)))>"Cancel"</a>
-                </p>
-            </form>
+            <p class="hint">"These Services stay, without a Parent Service."</p>
+            <ul>
+                #[key(child.id)]
+                for child in child_services {
+                    <li>(child.name)</li>
+                }
+            </ul>
         }
+        <form method="post" action=(href!(delete_service, ServiceId(service_id)))>
+            <p class="actions">
+                <button type="submit" class="danger">"Delete " (name.clone())</button>
+                <a href=(href!(service_detail, ServiceId(service_id)))>"Cancel"</a>
+            </p>
+        </form>
     })
 }

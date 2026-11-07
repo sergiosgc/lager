@@ -375,7 +375,6 @@ async fn deleting_a_group_removes_memberships_and_un_nests_its_children() {
     assert_eq!(preview.group.name, "eu");
     assert_eq!(host_names(&preview.member_hosts), ["web1", "web2"]);
     assert_eq!(group_names(&preview.child_groups), ["lisbon", "paris"]);
-    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
     assert_eq!(done.value, preview);
 
     assert_eq!(inventory.group(eu.id).await.unwrap(), None);
@@ -415,7 +414,6 @@ async fn deleting_a_host_removes_its_memberships() {
     let done = inventory.delete_host(web1.id).await.unwrap();
 
     assert_eq!(group_names(&preview.groups), ["eu", "web"]);
-    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
     assert_eq!(done.value, preview);
     assert_eq!(
         rows_referring_to(&db, "host_group_membership", "host", web1.id),

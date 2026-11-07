@@ -10,11 +10,13 @@ mod hierarchy;
 mod hosts;
 mod models;
 mod server_index;
+mod service_instances;
 mod services;
 mod variables;
 
 pub use groups::{Group, GroupDeletion, GroupTreeEntry};
 pub use hosts::{Host, HostDeletion, normalize_host_name};
+pub use service_instances::{ServiceInstance, ServiceInstanceDeletion};
 pub use services::{Service, ServiceDeletion, ServiceTreeEntry};
 pub use variables::{EffectiveVariable, OwnVariable, Owner, Source};
 
@@ -22,6 +24,7 @@ use groups::*;
 use hierarchy::*;
 use hosts::*;
 use server_index::*;
+use service_instances::*;
 use services::*;
 use variables::*;
 
@@ -155,42 +158,6 @@ impl Inventory {
     }
 }
 
-/// Refuses a delete while something blocks it, naming the entity (submitted
-/// as `field`) and every blocker.
-fn refuse_if_blocked(field: &'static str, name: &str, blockers: &[String]) -> Result<(), Error> {
-    if blockers.is_empty() {
-        return Ok(());
-    }
-    Err(invalid(
-        field,
-        format!("{name} can't be deleted yet. {}", blockers.join(" ")),
-    ))
-}
-
-/// `"1 Group"`, `"2 Groups"`.
-fn plural(n: i64, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
-}
-
-/// Runs a raw `SELECT count(*) ... = ?1` query for one entity.
-///
-/// A result in any other shape is an error rather than 0: a wrong 0 would
-/// let a delete through and orphan rows (ADR 0002, ADR 0003).
-async fn count_rows(db: &mut impl toasty::Executor, sql: &str, id: i64) -> Result<i64, Error> {
-    let rows = toasty::sql::query(sql).bind(id).exec(db).await?;
-    let mut rows = rows.into_iter();
-    match (rows.next(), rows.next()) {
-        (Some(Value::Record(r)), None) => match r.into_iter().collect::<Vec<_>>().as_slice() {
-            [Value::I64(n)] => Ok(*n),
-            other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
-        },
-        other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
-    }
-}
 fn invalid(field: &'static str, message: impl Into<String>) -> Error {
     Error::Invalid {
         field,
@@ -218,7 +185,8 @@ async fn open_without_foreign_keys(path: &Path) -> toasty::Result<toasty::Db> {
             models::HostVariable,
             models::Group,
             models::Membership,
-            models::Service
+            models::Service,
+            models::ServiceInstance
         ))
         .max_pool_size(1)
         .build(driver)

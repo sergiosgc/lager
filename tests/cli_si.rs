@@ -221,3 +221,68 @@ async fn lists_the_group_variables_lager_set() {
         "{listing:#}"
     );
 }
+
+#[tokio::test]
+async fn shows_the_service_instances_lager_wrote_with_hierarchy_and_vars() {
+    if let Some(reason) = missing_python() {
+        eprintln!(
+            "SKIPPED shows_the_service_instances_lager_wrote_with_hierarchy_and_vars: {reason}"
+        );
+        return;
+    }
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web = inventory.create_service("web").await.unwrap().value;
+    let nginx = inventory.create_service("nginx").await.unwrap().value;
+    inventory
+        .set_service_parent(nginx.id, Some(web.id))
+        .await
+        .unwrap();
+    let main = inventory
+        .create_service_instance(web1.id, nginx.id, "main", "192.0.2.10")
+        .await
+        .unwrap()
+        .value;
+    let admin = inventory
+        .create_service_instance(web1.id, nginx.id, "admin", "2001:db8::10")
+        .await
+        .unwrap()
+        .value;
+    for (owner, name, value) in [
+        (Owner::Service(web.id), "port", "80"),
+        (Owner::Service(web.id), "tls", "false"),
+        (Owner::Service(nginx.id), "port", "8080"),
+        (Owner::ServiceInstance(main.id), "tls", "true"),
+        (Owner::ServiceInstance(main.id), "workers", "4"),
+    ] {
+        inventory.set_variable(owner, name, value).await.unwrap();
+    }
+    inventory
+        .update_service_instance(admin.id, "admin", "2001:db8::11")
+        .await
+        .unwrap();
+
+    let host = run_si(&db.path, &["--host", "web1"]);
+    let listing = run_si(&db.path, &["--list"]);
+
+    let expected = serde_json::json!({
+        "main": {
+            "service": "nginx",
+            "ip": "192.0.2.10",
+            "hierarchy": ["nginx", "web"],
+            "vars": {"port": 8080, "tls": true, "workers": 4},
+        },
+        "admin": {
+            "service": "nginx",
+            "ip": "2001:db8::11",
+            "hierarchy": ["nginx", "web"],
+            "vars": {"port": 8080, "tls": false},
+        },
+    });
+    assert_eq!(host["service_instances"]["nginx"], expected, "{host:#}");
+    assert_eq!(
+        listing["_meta"]["hostvars"]["web1"]["service_instances"]["nginx"], expected,
+        "{listing:#}"
+    );
+}

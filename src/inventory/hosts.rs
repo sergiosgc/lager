@@ -18,8 +18,8 @@ impl From<models::Host> for Host {
     }
 }
 
-/// What deleting a Host removes: the Host, its Own Variables and its Group
-/// memberships. While `blockers` isn't empty, the Host can't be deleted.
+/// What deleting a Host removes: the Host, its Own Variables, its Group
+/// memberships, and its Service Instances with their Own Variables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostDeletion {
     pub host: Host,
@@ -29,9 +29,7 @@ pub struct HostDeletion {
     /// Memberships of Groups that no longer exist, left behind by `cli/si`;
     /// the delete removes them too.
     pub missing_memberships: usize,
-    /// Relations lager can't remove yet (Service Instances), each as a
-    /// sentence for the operator.
-    pub blockers: Vec<String>,
+    pub service_instances: Vec<ServiceInstanceDeletion>,
 }
 
 impl Inventory {
@@ -111,12 +109,11 @@ impl Inventory {
 
     /// Deletes a Host and everything listed by [`Inventory::host_deletion`],
     /// in one transaction, returning what was removed. Variable names stay.
-    /// Refused while the Host has relations lager can't remove yet.
     pub async fn delete_host(&self, host_id: i64) -> Result<Done<HostDeletion>, Error> {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let plan = plan_host_deletion(&mut tx, host_id).await?;
-        refuse_if_blocked("host", &plan.host.name, &plan.blockers)?;
+        delete_instances(&mut tx, &plan.service_instances).await?;
         delete_owner_values(&mut tx, Owner::Host(host_id)).await?;
         models::Membership::filter(models::Membership::fields().host_id().eq(host_id))
             .delete()
@@ -190,28 +187,14 @@ pub(super) async fn plan_host_deletion(
             .exec(&mut *db)
             .await?
             .len();
-    // TEMPORARY until lager manages Service Instances (#13): not modelled
-    // yet, so counted with raw SQL, and they block the delete instead of
-    // cascading.
-    let instances = count_rows(
-        &mut *db,
-        "SELECT count(*) FROM service_instance WHERE host = ?1",
-        host_id,
-    )
-    .await?;
-    let mut blockers = Vec::new();
-    if instances > 0 {
-        blockers.push(format!(
-            "It has {}, and lager can't delete Service Instances yet.",
-            plural(instances, "Service Instance")
-        ));
-    }
+    let instances = instances_on_host(&mut *db, host_id).await?;
+    let service_instances = plan_instance_deletions(&mut *db, instances).await?;
     Ok(HostDeletion {
         host: host.into(),
         own_variables,
         missing_memberships: memberships - groups.len(),
         groups,
-        blockers,
+        service_instances,
     })
 }
 

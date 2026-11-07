@@ -17,6 +17,7 @@ use topcoat::{
 
 mod groups;
 mod hosts;
+mod service_instances;
 mod services;
 mod variables;
 
@@ -65,6 +66,14 @@ pub fn router(inventory: Inventory) -> Router {
         .page(services::remove_service_variable)
         .page(services::delete_service_confirmation)
         .page(services::delete_service)
+        .page(services::add_service_instance)
+        .page(hosts::add_host_instance)
+        .page(service_instances::instance_detail)
+        .page(service_instances::update_instance)
+        .page(service_instances::set_instance_variable)
+        .page(service_instances::remove_instance_variable)
+        .page(service_instances::delete_instance_confirmation)
+        .page(service_instances::delete_instance)
         .build()
 }
 

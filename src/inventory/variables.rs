@@ -21,6 +21,7 @@ pub enum Owner {
     Host(i64),
     Group(i64),
     Service(i64),
+    ServiceInstance(i64),
 }
 
 impl Owner {
@@ -32,12 +33,16 @@ impl Owner {
             Owner::Host(_) => ("host_variable", "host"),
             Owner::Group(_) => ("host_group_variable", r#""group""#),
             Owner::Service(_) => ("service_variable", "service"),
+            Owner::ServiceInstance(_) => ("service_instance_variable", "instance"),
         }
     }
 
     fn id(self) -> i64 {
         match self {
-            Owner::Host(id) | Owner::Group(id) | Owner::Service(id) => id,
+            Owner::Host(id)
+            | Owner::Group(id)
+            | Owner::Service(id)
+            | Owner::ServiceInstance(id) => id,
         }
     }
 }
@@ -97,7 +102,7 @@ impl Inventory {
         write_variable(&mut tx, owner, name, value).await?;
         let warnings = match owner {
             Owner::Host(host_id) => host_warnings(&mut tx, host_id).await?,
-            Owner::Group(_) | Owner::Service(_) => Vec::new(),
+            Owner::Group(_) | Owner::Service(_) | Owner::ServiceInstance(_) => Vec::new(),
         };
         tx.commit().await?;
         Ok(Done {
@@ -132,7 +137,8 @@ impl Inventory {
     /// deepest below the top of the hierarchy first, so a child Group always
     /// wins over its Parent Group; at the same depth, the highest
     /// `ansible_group_priority`; then the last by name (ADR 0004). A Service
-    /// inherits from its Parent Services, nearest first.
+    /// inherits from its Parent Services, nearest first; a Service Instance
+    /// from its Service, then that Service's Parent Services.
     pub async fn effective_variables(&self, owner: Owner) -> Result<Vec<EffectiveVariable>, Error> {
         let mut db = self.db.clone();
         existing_owner(&mut db, owner).await?;
@@ -157,6 +163,10 @@ impl Inventory {
                 inherited_from_groups(&mut db, parent.into_iter().collect()).await?
             }
             Owner::Service(service_id) => inherited_from_services(&mut db, service_id).await?,
+            Owner::ServiceInstance(id) => {
+                let service_id = existing_instance(&mut db, id).await?.service_id;
+                service_and_ancestors(&mut db, service_id).await?
+            }
         });
         resolve(&mut db, layers).await
     }
@@ -227,6 +237,32 @@ async fn inherited_from_services(
         };
         layers.push((source, owner_values(&mut *db, Owner::Service(id)).await?));
     }
+    Ok(layers)
+}
+
+/// The layers a Service Instance inherits: its Service's own values, then
+/// that Service's Parent Services, nearest first. A Service that no longer
+/// exists contributes nothing.
+async fn service_and_ancestors(
+    db: &mut impl toasty::Executor,
+    service_id: i64,
+) -> Result<Vec<Layer>, Error> {
+    let Some(service) = models::Service::filter_by_id(service_id)
+        .first()
+        .exec(&mut *db)
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let own = owner_values(&mut *db, Owner::Service(service_id)).await?;
+    let mut layers = vec![(
+        Source::Service {
+            id: service_id,
+            name: service.name,
+        },
+        own,
+    )];
+    layers.extend(inherited_from_services(db, service_id).await?);
     Ok(layers)
 }
 
@@ -326,6 +362,7 @@ pub(super) async fn existing_owner(
         Owner::Host(id) => existing_host(db, id).await.map(|_| ()),
         Owner::Group(id) => existing_group(db, id).await.map(|_| ()),
         Owner::Service(id) => existing_service(db, id).await.map(|_| ()),
+        Owner::ServiceInstance(id) => existing_instance(db, id).await.map(|_| ()),
     }
 }
 

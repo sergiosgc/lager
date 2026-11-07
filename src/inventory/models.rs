@@ -77,3 +77,23 @@ pub struct Service {
     #[column("parent")]
     pub parent_id: Option<i64>,
 }
+
+/// One deployment of a Service on a Host. `name` is the Instance Name.
+/// The schema makes (service, host, name) unique (ADR 0003).
+#[derive(Debug, toasty::Model)]
+#[table = "service_instance"]
+pub struct ServiceInstance {
+    #[key]
+    #[auto(increment)]
+    pub id: i64,
+
+    #[column("service")]
+    pub service_id: i64,
+
+    #[column("host")]
+    pub host_id: i64,
+
+    pub ip: String,
+
+    pub name: String,
+}

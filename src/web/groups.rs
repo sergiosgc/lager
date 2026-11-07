@@ -400,89 +400,64 @@ async fn group_view(
 pub(super) async fn delete_group_confirmation(cx: &Cx) -> Result<impl View> {
     let id = *path_param::<GroupId>(cx)?;
     let deletion = inventory(cx).group_deletion(id).await.map_err(page_error)?;
-    Ok(view! { delete_group_view(deletion: deletion, refused: false) })
+    Ok(view! { delete_group_view(deletion: deletion) })
 }
 
 #[page(POST "/groups/{group_id}/delete")]
 pub(super) async fn delete_group(cx: &Cx) -> Result<impl View> {
     let id = *path_param::<GroupId>(cx)?;
-    match inventory(cx).delete_group(id).await {
-        Ok(_) => Err(see_other(href!(groups_list).resolve(cx)).into()),
-        // Something blocks the delete: show the confirmation page again,
-        // which says what.
-        Err(crate::inventory::Error::Invalid { .. }) => {
-            let deletion = inventory(cx).group_deletion(id).await.map_err(page_error)?;
-            Ok(view! { delete_group_view(deletion: deletion, refused: true) })
-        }
-        Err(e) => Err(page_error(e)),
-    }
+    inventory(cx).delete_group(id).await.map_err(page_error)?;
+    Err::<(), _>(see_other(href!(groups_list).resolve(cx)).into())
 }
 
-/// The delete confirmation: what changes, or why the Group can't be deleted
-/// yet. `refused` marks a delete that was attempted and blocked.
+/// The delete confirmation: everything that will be removed or changed.
 #[component]
-async fn delete_group_view(deletion: GroupDeletion, refused: bool) -> Result<impl View> {
+async fn delete_group_view(deletion: GroupDeletion) -> Result<impl View> {
     let GroupDeletion {
         group,
         member_hosts,
         child_groups,
         own_variables,
         missing_memberships,
-        blockers,
     } = deletion;
     let group_id = group.id;
     let name = group.name;
     Ok(view! {
-        if refused {
-            (StatusCode::CONFLICT)
-        }
         <h1>"Delete " (name.clone())</h1>
-        if !blockers.is_empty() {
-            <div class="error" role="alert">
-                <p>(name.clone()) " can't be deleted yet."</p>
-                <ul>
-                    for blocker in blockers {
-                        <li>(blocker)</li>
-                    }
-                </ul>
-            </div>
-            <p><a href=(href!(group_detail, GroupId(group_id)))>"Back to " (name)</a></p>
+        <p>"This removes the Group " <strong>(name.clone())</strong> "."</p>
+        removed_variables_section(variables: own_variables)
+        <h2>"Hosts leaving it"</h2>
+        if member_hosts.is_empty() {
+            <p>"None: no Host is directly in it."</p>
         } else {
-            <p>"This removes the Group " <strong>(name.clone())</strong> "."</p>
-            removed_variables_section(variables: own_variables)
-            <h2>"Hosts leaving it"</h2>
-            if member_hosts.is_empty() {
-                <p>"None: no Host is directly in it."</p>
-            } else {
-                <p class="hint">"The Hosts themselves stay."</p>
-                <ul>
-                    #[key(host.id)]
-                    for host in member_hosts {
-                        <li>(host.name)</li>
-                    }
-                </ul>
-            }
-            if missing_memberships > 0 {
-                <p>"Also removes " (missing_memberships) " membership(s) of Hosts that no longer exist."</p>
-            }
-            <h2>"Child Groups becoming top-level"</h2>
-            if child_groups.is_empty() {
-                <p>"None: no Group is nested inside it."</p>
-            } else {
-                <p class="hint">"These Groups stay, without a Parent Group."</p>
-                <ul>
-                    #[key(child.id)]
-                    for child in child_groups {
-                        <li>(child.name)</li>
-                    }
-                </ul>
-            }
-            <form method="post" action=(href!(delete_group, GroupId(group_id)))>
-                <p class="actions">
-                    <button type="submit" class="danger">"Delete " (name.clone())</button>
-                    <a href=(href!(group_detail, GroupId(group_id)))>"Cancel"</a>
-                </p>
-            </form>
+            <p class="hint">"The Hosts themselves stay."</p>
+            <ul>
+                #[key(host.id)]
+                for host in member_hosts {
+                    <li>(host.name)</li>
+                }
+            </ul>
         }
+        if missing_memberships > 0 {
+            <p>"Also removes " (missing_memberships) " membership(s) of Hosts that no longer exist."</p>
+        }
+        <h2>"Child Groups becoming top-level"</h2>
+        if child_groups.is_empty() {
+            <p>"None: no Group is nested inside it."</p>
+        } else {
+            <p class="hint">"These Groups stay, without a Parent Group."</p>
+            <ul>
+                #[key(child.id)]
+                for child in child_groups {
+                    <li>(child.name)</li>
+                }
+            </ul>
+        }
+        <form method="post" action=(href!(delete_group, GroupId(group_id)))>
+            <p class="actions">
+                <button type="submit" class="danger">"Delete " (name.clone())</button>
+                <a href=(href!(group_detail, GroupId(group_id)))>"Cancel"</a>
+            </p>
+        </form>
     })
 }

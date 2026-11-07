@@ -15,12 +15,18 @@ use topcoat::{
 };
 
 use super::groups::{GroupId, group_detail};
+use super::service_instances::{
+    FailedInstance, InstanceFields, add_instance_form, host_instances_list,
+    removed_instances_section,
+};
 use super::variables::{
     FailedVariable, RemoveVariable, VariableInput, effective_variables_section,
     own_variables_section, removed_variables_section,
 };
 use super::{FieldError, inventory, page_error};
-use crate::inventory::{EffectiveVariable, Group, Host, HostDeletion, OwnVariable, Owner};
+use crate::inventory::{
+    EffectiveVariable, Group, Host, HostDeletion, OwnVariable, Owner, Service, ServiceInstance,
+};
 
 #[page("/hosts")]
 pub(super) async fn hosts_list(cx: &Cx) -> Result<impl View> {
@@ -136,7 +142,7 @@ topcoat::router::path_param!(pub(super) host_id: i64, error = not_found);
 pub(super) async fn host_detail(cx: &Cx) -> Result<impl View> {
     let host = path_host(cx).await?;
     let page = load_host_page(cx, host).await?;
-    Ok(view! { host_view(page: page, failed: None) })
+    Ok(view! { host_view(page: page, failed: None, failed_instance: None) })
 }
 
 /// Everything a Host's page shows.
@@ -149,6 +155,9 @@ pub(super) struct HostPage {
     groups: Vec<Group>,
     /// Every Group, for adding the Host to one or replacing its set.
     all_groups: Vec<Group>,
+    instances: Vec<ServiceInstance>,
+    /// Every Service, for adding a Service Instance.
+    services: Vec<Service>,
 }
 
 async fn load_host_page(cx: &Cx, host: Host) -> Result<HostPage> {
@@ -159,6 +168,8 @@ async fn load_host_page(cx: &Cx, host: Host) -> Result<HostPage> {
         warnings: inventory.host_warnings(host.id).await?,
         groups: inventory.host_groups(host.id).await?,
         all_groups: inventory.groups().await?,
+        instances: inventory.instances_on_host(host.id).await?,
+        services: inventory.services().await?,
         host,
     })
 }
@@ -187,7 +198,7 @@ pub(super) async fn set_host_variable(
                 field,
                 message,
             };
-            Ok(view! { host_view(page: page, failed: Some(failed)) })
+            Ok(view! { host_view(page: page, failed: Some(failed), failed_instance: None) })
         }
         Err(e) => Err(page_error(e)),
     }
@@ -215,6 +226,40 @@ fn host_url(cx: &Cx, host_id: i64, section: &str) -> String {
         "{}#{section}",
         href!(host_detail, HostId(host_id)).resolve(cx)
     )
+}
+
+#[derive(Deserialize)]
+pub(super) struct HostInstanceInput {
+    service: i64,
+    #[serde(flatten)]
+    fields: InstanceFields,
+}
+
+#[page(POST "/hosts/{host_id}/instances")]
+pub(super) async fn add_host_instance(
+    cx: &Cx,
+    Form(input): Form<HostInstanceInput>,
+) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    match inventory(cx)
+        .create_service_instance(host.id, input.service, &input.fields.name, &input.fields.ip)
+        .await
+    {
+        Ok(_) => Err(see_other(host_url(cx, host.id, "instances")).into()),
+        Err(inventory::Error::Invalid { field, message }) => {
+            let page = load_host_page(cx, host).await?;
+            let failed_instance = FailedInstance {
+                choice: Some(input.service),
+                fields: input.fields,
+                field,
+                message,
+            };
+            Ok(
+                view! { host_view(page: page, failed: None, failed_instance: Some(failed_instance)) },
+            )
+        }
+        Err(e) => Err(page_error(e)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -274,7 +319,12 @@ pub(super) async fn set_host_groups(
 /// A Host's page: its Groups, Own Variables and Effective Variables. A
 /// rejected Variable submission is shown again with its error.
 #[component]
-async fn host_view(cx: &Cx, page: HostPage, failed: Option<FailedVariable>) -> Result<impl View> {
+async fn host_view(
+    cx: &Cx,
+    page: HostPage,
+    failed: Option<FailedVariable>,
+    failed_instance: Option<FailedInstance>,
+) -> Result<impl View> {
     let HostPage {
         host,
         variables,
@@ -282,6 +332,8 @@ async fn host_view(cx: &Cx, page: HostPage, failed: Option<FailedVariable>) -> R
         warnings,
         groups,
         all_groups,
+        instances,
+        services,
     } = page;
     let host_id = host.id;
     let addable: Vec<Group> = all_groups
@@ -289,7 +341,7 @@ async fn host_view(cx: &Cx, page: HostPage, failed: Option<FailedVariable>) -> R
         .filter(|g| !groups.iter().any(|m| m.id == g.id))
         .cloned()
         .collect();
-    let status_failed = failed.is_some();
+    let status_failed = failed.is_some() || failed_instance.is_some();
     Ok(view! {
         if status_failed {
             (StatusCode::UNPROCESSABLE_ENTITY)
@@ -361,6 +413,16 @@ async fn host_view(cx: &Cx, page: HostPage, failed: Option<FailedVariable>) -> R
                 </form>
             </details>
         }
+
+        <h2 id="instances">"Service Instances"</h2>
+        host_instances_list(instances: instances)
+        add_instance_form(
+            action: href!(add_host_instance, HostId(host_id)).resolve(cx),
+            choice_name: "service",
+            choice_label: "Service",
+            choices: services.into_iter().map(|s| (s.id, s.name)).collect(),
+            failed: failed_instance,
+        )
 
         own_variables_section(
             set_url: href!(set_host_variable, HostId(host_id)).resolve(cx),
@@ -434,70 +496,52 @@ async fn rename_host_view(host: Host, name: String, error: Option<String>) -> Re
 pub(super) async fn delete_host_confirmation(cx: &Cx) -> Result<impl View> {
     let id = *path_param::<HostId>(cx)?;
     let deletion = inventory(cx).host_deletion(id).await.map_err(page_error)?;
-    Ok(view! { delete_host_view(deletion: deletion, refused: false) })
+    Ok(view! { delete_host_view(deletion: deletion) })
 }
 
 #[page(POST "/hosts/{host_id}/delete")]
 pub(super) async fn delete_host(cx: &Cx) -> Result<impl View> {
     let id = *path_param::<HostId>(cx)?;
-    match inventory(cx).delete_host(id).await {
-        Ok(_) => Err(see_other(href!(hosts_list).resolve(cx)).into()),
-        // Something blocks the delete: show the confirmation page again,
-        // which says what.
-        Err(inventory::Error::Invalid { .. }) => {
-            let deletion = inventory(cx).host_deletion(id).await.map_err(page_error)?;
-            Ok(view! { delete_host_view(deletion: deletion, refused: true) })
-        }
-        Err(e) => Err(page_error(e)),
-    }
+    inventory(cx).delete_host(id).await.map_err(page_error)?;
+    Err::<(), _>(see_other(href!(hosts_list).resolve(cx)).into())
 }
 
-/// The delete confirmation: everything that will be removed, or why the
-/// Host can't be deleted yet. `refused` marks a delete that was attempted
-/// and blocked.
+/// The delete confirmation: everything that will be removed.
 #[component]
-async fn delete_host_view(deletion: HostDeletion, refused: bool) -> Result<impl View> {
-    let host_id = deletion.host.id;
-    let blocked = !deletion.blockers.is_empty();
+async fn delete_host_view(deletion: HostDeletion) -> Result<impl View> {
+    let HostDeletion {
+        host,
+        own_variables,
+        groups,
+        missing_memberships,
+        service_instances,
+    } = deletion;
+    let host_id = host.id;
     Ok(view! {
-        if refused {
-            (StatusCode::CONFLICT)
-        }
-        <h1>"Delete " (deletion.host.name.clone())</h1>
-        if blocked {
-            <div class="error" role="alert">
-                <p>(deletion.host.name.clone()) " can't be deleted yet."</p>
-                <ul>
-                    for blocker in deletion.blockers {
-                        <li>(blocker)</li>
-                    }
-                </ul>
-            </div>
-            <p><a href=(href!(host_detail, HostId(host_id)))>"Back to " (deletion.host.name)</a></p>
+        <h1>"Delete " (host.name.clone())</h1>
+        <p>"This removes the Host " <strong>(host.name.clone())</strong> " and:"</p>
+        removed_variables_section(variables: own_variables)
+        removed_instances_section(instances: service_instances)
+        <h2>"Groups it leaves"</h2>
+        if groups.is_empty() {
+            <p>"None: it isn't directly in any Group."</p>
         } else {
-            <p>"This removes the Host " <strong>(deletion.host.name.clone())</strong> " and:"</p>
-            removed_variables_section(variables: deletion.own_variables)
-            <h2>"Groups it leaves"</h2>
-            if deletion.groups.is_empty() {
-                <p>"None: it isn't directly in any Group."</p>
-            } else {
-                <p class="hint">"The Groups themselves stay."</p>
-                <ul>
-                    #[key(group.id)]
-                    for group in deletion.groups {
-                        <li>(group.name)</li>
-                    }
-                </ul>
-            }
-            if deletion.missing_memberships > 0 {
-                <p>"Also removes " (deletion.missing_memberships) " membership(s) of Groups that no longer exist."</p>
-            }
-            <form method="post" action=(href!(delete_host, HostId(host_id)))>
-                <p class="actions">
-                    <button type="submit" class="danger">"Delete " (deletion.host.name)</button>
-                    <a href=(href!(host_detail, HostId(host_id)))>"Cancel"</a>
-                </p>
-            </form>
+            <p class="hint">"The Groups themselves stay."</p>
+            <ul>
+                #[key(group.id)]
+                for group in groups {
+                    <li>(group.name)</li>
+                }
+            </ul>
         }
+        if missing_memberships > 0 {
+            <p>"Also removes " (missing_memberships) " membership(s) of Groups that no longer exist."</p>
+        }
+        <form method="post" action=(href!(delete_host, HostId(host_id)))>
+            <p class="actions">
+                <button type="submit" class="danger">"Delete " (host.name)</button>
+                <a href=(href!(host_detail, HostId(host_id)))>"Cancel"</a>
+            </p>
+        </form>
     })
 }

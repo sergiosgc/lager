@@ -315,7 +315,6 @@ async fn deleting_a_service_removes_its_variables_and_un_nests_its_children() {
     assert_eq!(preview.service.name, "mysql");
     assert_eq!(preview.own_variables, [own("port", "3306")]);
     assert_eq!(names(&preview.child_services), ["mariadb", "percona"]);
-    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
     assert_eq!(done.value, preview);
 
     assert_eq!(inventory.service(mysql.id).await.unwrap(), None);
@@ -343,39 +342,4 @@ async fn deleting_a_service_removes_its_variables_and_un_nests_its_children() {
             .unwrap()
             .contains(&"port".to_string())
     );
-}
-
-#[tokio::test]
-async fn a_service_with_service_instances_cannot_be_deleted_yet() {
-    let db = temp_db();
-    let inventory = open(&db).await;
-    let nginx = service(&inventory, "nginx").await;
-    // Written by cli/si: Service Instances arrive with #13.
-    sql(
-        &db,
-        &format!(
-            "INSERT INTO host(id, name) VALUES (1, 'web1');
-             INSERT INTO service_instance(service, host, ip, name) VALUES ({}, 1, '192.0.2.10', 'main');",
-            nginx.id
-        ),
-    );
-
-    let preview = inventory.service_deletion(nginx.id).await.unwrap();
-    let err = inventory.delete_service(nginx.id).await.unwrap_err();
-
-    assert_eq!(
-        preview.blockers,
-        ["It has 1 Service Instance, and lager can't delete Service Instances yet."]
-    );
-    assert!(
-        matches!(
-            err,
-            Error::Invalid {
-                field: "service",
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    assert!(inventory.service(nginx.id).await.unwrap().is_some());
 }

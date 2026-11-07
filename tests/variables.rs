@@ -129,7 +129,6 @@ async fn deleting_a_group_removes_its_own_variables_after_listing_them() {
     let done = inventory.delete_group(web.id).await.unwrap();
 
     assert_eq!(preview.own_variables, [own("port", "80")]);
-    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
     assert_eq!(done.value, preview);
     assert_eq!(
         rows_referring_to(&db, "host_group_variable", "\"group\"", web.id),

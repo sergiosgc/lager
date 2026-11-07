@@ -219,25 +219,6 @@ async fn deleting_a_host_goes_through_a_confirmation_listing_its_variables() {
     assert!(!text(get(&router, "/hosts").await).await.contains("web1"));
 }
 
-#[tokio::test]
-async fn a_host_with_a_service_instance_cannot_be_deleted_yet() {
-    let (db, router) = app().await;
-    let host = create_host(&router, "web1").await;
-    common::sql(
-        &db,
-        "INSERT INTO service(id, name) VALUES (1, 'nginx');
-         INSERT INTO service_instance(service, host, ip, name) SELECT 1, id, '192.0.2.10', 'main' FROM host;",
-    );
-
-    let confirm = text(get(&router, &format!("{host}/delete")).await).await;
-    assert!(confirm.contains("1 Service Instance"), "{confirm}");
-    assert!(!confirm.contains("<button"), "no delete button: {confirm}");
-
-    let refused = post_form(&router, &format!("{host}/delete"), "").await;
-    assert_eq!(refused.status(), StatusCode::CONFLICT);
-    assert_eq!(get(&router, &host).await.status(), StatusCode::OK);
-}
-
 /// Creates a Group through the form and returns its page's path.
 async fn create_group(router: &Router, name: &str) -> String {
     let created = post_form(router, "/groups/new", &format!("name={name}")).await;
@@ -485,4 +466,122 @@ async fn manages_services_their_parents_and_inherited_variables() {
             .await
             .contains("A top-level Service.")
     );
+}
+
+#[tokio::test]
+async fn manages_service_instances_from_host_and_service_pages() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let web2 = create_host(&router, "web2").await;
+    let nginx = create_service(&router, "nginx").await;
+
+    // From the Host page: a bad IP is rejected with the input kept.
+    let rejected = post_form(
+        &router,
+        &format!("{host}/instances"),
+        &format!("service={}&name=main&ip=192.0.2.999", id_of(&nginx)),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("is not an IP address"), "{page}");
+    assert!(page.contains(r#"value="192.0.2.999""#), "{page}");
+
+    let added = post_form(
+        &router,
+        &format!("{host}/instances"),
+        &format!("service={}&name=main&ip=192.0.2.10", id_of(&nginx)),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::SEE_OTHER);
+    // From the Service page, on another Host.
+    let added = post_form(
+        &router,
+        &format!("{nginx}/instances"),
+        &format!("host={}&name=main&ip=2001:db8::20", id_of(&web2)),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::SEE_OTHER);
+    // A duplicate (Service, Host, Instance Name) is rejected.
+    let duplicate = post_form(
+        &router,
+        &format!("{nginx}/instances"),
+        &format!("host={}&name=main&ip=192.0.2.11", id_of(&host)),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        text(duplicate)
+            .await
+            .contains("web1 already has a Service Instance of nginx named main")
+    );
+
+    let service_page = text(get(&router, &nginx).await).await;
+    assert!(
+        service_page.contains("<code>2001:db8::20</code>"),
+        "{service_page}"
+    );
+    let host_page = text(get(&router, &host).await).await;
+    let start = host_page.find("/instances/").expect("an instance link");
+    let instance = host_page[start..].split('"').next().unwrap().to_string();
+
+    // Edit it, give it a Variable, see it inherit from its Service.
+    post_form(
+        &router,
+        &format!("{nginx}/variables"),
+        "form=add&name=port&value=80",
+    )
+    .await;
+    let edited = post_form(&router, &instance, "name=primary&ip=192.0.2.12").await;
+    assert_eq!(edited.status(), StatusCode::SEE_OTHER);
+    post_form(
+        &router,
+        &format!("{instance}/variables"),
+        "form=add&name=workers&value=4",
+    )
+    .await;
+    let page = text(get(&router, &instance).await).await;
+    assert!(page.contains(r#"value="primary""#), "{page}");
+    assert!(page.contains("<code>80</code>"), "inherited port: {page}");
+    assert!(page.contains(&format!(r#"href="{nginx}""#)), "{page}");
+
+    // Deleting the Host lists the Service Instance, then removes it.
+    let confirm = text(get(&router, &format!("{host}/delete")).await).await;
+    assert!(confirm.contains("nginx primary on web1"), "{confirm}");
+    assert!(confirm.contains("workers"), "{confirm}");
+    post_form(&router, &format!("{host}/delete"), "").await;
+    assert_eq!(
+        get(&router, &instance).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        !text(get(&router, &nginx).await)
+            .await
+            .contains("192.0.2.12")
+    );
+}
+
+#[tokio::test]
+async fn a_service_instance_whose_host_is_gone_can_still_be_deleted() {
+    let (db, router) = app().await;
+    let nginx = create_service(&router, "nginx").await;
+    // cli/si's host delete leaves the Service Instance behind (ADR 0003).
+    common::sql(
+        &db,
+        &format!(
+            "INSERT INTO service_instance(id, service, host, ip, name) VALUES (50, {}, 999, '192.0.2.50', 'stale');",
+            id_of(&nginx)
+        ),
+    );
+
+    let page = text(get(&router, &nginx).await).await;
+    assert!(page.contains("(Host 999, missing)"), "{page}");
+    assert!(
+        !page.contains(r#"href="/hosts/999""#),
+        "no link to a missing Host: {page}"
+    );
+
+    let deleted = post_form(&router, "/instances/50/delete", "").await;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&deleted), format!("{nginx}#instances"));
 }

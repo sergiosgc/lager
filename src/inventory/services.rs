@@ -43,17 +43,16 @@ pub struct ServiceTreeEntry {
     pub service: Service,
 }
 
-/// What deleting a Service does: removes it and its Own Variables, and
-/// clears the Parent Service of its child Services (which stay). While
-/// `blockers` isn't empty, the Service can't be deleted.
+/// What deleting a Service does: removes it, its Own Variables and its
+/// Service Instances with theirs, and clears the Parent Service of its child
+/// Services (which stay).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceDeletion {
     pub service: Service,
     pub own_variables: Vec<OwnVariable>,
     /// Services that lose their Parent Service (and become top-level).
     pub child_services: Vec<Service>,
-    /// Relations lager can't remove yet, each as a sentence for the operator.
-    pub blockers: Vec<String>,
+    pub service_instances: Vec<ServiceInstanceDeletion>,
 }
 
 impl Inventory {
@@ -163,7 +162,7 @@ impl Inventory {
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let plan = plan_service_deletion(&mut tx, service_id).await?;
-        refuse_if_blocked("service", &plan.service.name, &plan.blockers)?;
+        delete_instances(&mut tx, &plan.service_instances).await?;
         delete_owner_values(&mut tx, Owner::Service(service_id)).await?;
         for child in &plan.child_services {
             let mut child = existing_service(&mut tx, child.id).await?;
@@ -255,26 +254,12 @@ async fn plan_service_deletion(
     let service = existing_service(&mut *db, service_id).await?;
     let own_variables = own_variables_to_delete(&mut *db, Owner::Service(service_id)).await?;
     let child_services = child_services(&mut *db, service_id).await?;
-    // TEMPORARY until lager manages Service Instances (#13): not modelled
-    // yet, so counted with raw SQL, and they block the delete instead of
-    // cascading.
-    let instances = count_rows(
-        &mut *db,
-        "SELECT count(*) FROM service_instance WHERE service = ?1",
-        service_id,
-    )
-    .await?;
-    let mut blockers = Vec::new();
-    if instances > 0 {
-        blockers.push(format!(
-            "It has {}, and lager can't delete Service Instances yet.",
-            plural(instances, "Service Instance")
-        ));
-    }
+    let instances = instances_of_service(&mut *db, service_id).await?;
+    let service_instances = plan_instance_deletions(&mut *db, instances).await?;
     Ok(ServiceDeletion {
         service: service.into(),
         own_variables,
         child_services,
-        blockers,
+        service_instances,
     })
 }

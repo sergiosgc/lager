@@ -795,7 +795,6 @@ async fn the_delete_preview_lists_the_host_and_its_own_variables() {
         preview.own_variables,
         [own("port", "80"), own(SERVER_INDEX, "1")]
     );
-    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
 }
 
 #[tokio::test]
@@ -849,36 +848,6 @@ async fn deleting_an_unknown_host_is_not_found() {
         inventory.delete_host(42).await,
         Err(Error::NotFound(_))
     ));
-}
-
-#[tokio::test]
-async fn a_host_with_service_instances_cannot_be_deleted_yet() {
-    let db = temp_db();
-    let inventory = open(&db).await;
-    let web1 = inventory.create_host("web1", None).await.unwrap().value;
-    // Written by cli/si: lager doesn't manage these relations yet.
-    sql(
-        &db,
-        &format!(
-            "INSERT INTO service(id, name) VALUES (1, 'nginx');
-             INSERT INTO service_instance(service, host, ip, name) VALUES (1, {id}, '192.0.2.10', 'main');",
-            id = web1.id
-        ),
-    );
-
-    let preview = inventory.host_deletion(web1.id).await.unwrap();
-    let err = inventory.delete_host(web1.id).await.unwrap_err();
-
-    assert_eq!(
-        preview.blockers,
-        ["It has 1 Service Instance, and lager can't delete Service Instances yet."]
-    );
-    assert!(
-        matches!(err, Error::Invalid { field: "host", .. }),
-        "{err:?}"
-    );
-    assert_eq!(inventory.host(web1.id).await.unwrap(), Some(web1.clone()));
-    assert_eq!(rows_referring_to(&db, "host_variable", "host", web1.id), 1);
 }
 
 #[tokio::test]
