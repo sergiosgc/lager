@@ -44,6 +44,17 @@ pub struct OwnVariable {
     pub value: String,
 }
 
+/// What deleting a Host removes: the Host and its Own Variables. While
+/// `blockers` isn't empty, the Host can't be deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostDeletion {
+    pub host: Host,
+    pub own_variables: Vec<OwnVariable>,
+    /// Relations lager can't remove yet (Group memberships, Service
+    /// Instances), each as a sentence for the operator.
+    pub blockers: Vec<String>,
+}
+
 /// The result of a successful change, with anything the operator should
 /// notice but that didn't stop it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +82,8 @@ pub enum Error {
     },
     /// The entity the change was aimed at doesn't exist.
     NotFound(String),
+    /// The database answered in a shape lager didn't expect.
+    Unexpected(String),
     Database(toasty::Error),
 }
 
@@ -79,6 +92,7 @@ impl fmt::Display for Error {
         match self {
             Error::Invalid { field, message } => write!(f, "{field}: {message}"),
             Error::NotFound(what) => write!(f, "{what} not found"),
+            Error::Unexpected(what) => write!(f, "unexpected database result: {what}"),
             Error::Database(e) => write!(f, "database error: {e}"),
         }
     }
@@ -189,30 +203,14 @@ impl Inventory {
         name: &str,
         server_index: Option<&str>,
     ) -> Result<Done<Host>, Error> {
-        let name = normalize_host_name(name);
-        if name.is_empty() {
-            return Err(invalid(
-                "name",
-                "A Host name can't be empty: it needs at least one letter, digit, \"-\" or \"_\".",
-            ));
-        }
-        let name = name.as_str();
+        let name = normalized_host_name(name)?;
         let server_index = server_index.filter(|v| !v.trim().is_empty());
         if let Some(value) = server_index {
             valid_json(SERVER_INDEX, value)?;
         }
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
-        let existing = models::Host::filter(models::Host::fields().name().eq(name))
-            .first()
-            .exec(&mut tx)
-            .await?;
-        if existing.is_some() {
-            return Err(invalid(
-                "name",
-                format!("A Host named {name} already exists."),
-            ));
-        }
+        unused_host_name(&mut tx, &name, None).await?;
         let host = models::Host::create().name(name).exec(&mut tx).await?;
         let index = match server_index {
             Some(value) => value.to_string(),
@@ -225,6 +223,54 @@ impl Inventory {
             value: host.into(),
             warnings,
         })
+    }
+
+    /// Renames a Host, keeping its identity, so everything attached to it
+    /// stays attached. The new name follows the same rules as on creation.
+    pub async fn rename_host(&self, host_id: i64, name: &str) -> Result<Done<Host>, Error> {
+        let name = normalized_host_name(name)?;
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        let mut host = existing_host(&mut tx, host_id).await?;
+        unused_host_name(&mut tx, &name, Some(host_id)).await?;
+        host.update().name(name).exec(&mut tx).await?;
+        tx.commit().await?;
+        Ok(Done::ok(host.into()))
+    }
+
+    /// What deleting a Host would remove, or why it can't be deleted yet.
+    /// [`Inventory::delete_host`] removes exactly this.
+    pub async fn host_deletion(&self, host_id: i64) -> Result<HostDeletion, Error> {
+        plan_host_deletion(&mut self.db.clone(), host_id).await
+    }
+
+    /// Deletes a Host and everything listed by [`Inventory::host_deletion`],
+    /// in one transaction, returning what was removed. Variable names stay.
+    /// Refused while the Host has relations lager can't remove yet.
+    pub async fn delete_host(&self, host_id: i64) -> Result<Done<HostDeletion>, Error> {
+        let mut db = self.db.clone();
+        let mut tx = db.transaction().await?;
+        let plan = plan_host_deletion(&mut tx, host_id).await?;
+        if !plan.blockers.is_empty() {
+            return Err(invalid(
+                "host",
+                format!(
+                    "{} can't be deleted yet. {}",
+                    plan.host.name,
+                    plan.blockers.join(" ")
+                ),
+            ));
+        }
+        models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        models::Host::filter_by_id(host_id)
+            .delete()
+            .exec(&mut tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Done::ok(plan))
     }
 
     /// The Server Index a new Host gets by default: one more than the
@@ -253,6 +299,7 @@ impl Inventory {
                 .into_iter()
                 .map(|v| (v.variable_id, v.value))
                 .collect(),
+            Unnamed::Skip,
         )
         .await
     }
@@ -315,11 +362,22 @@ impl Inventory {
     }
 }
 
+/// What to do with a value whose Variable row is missing (possible with
+/// foreign keys off, ADR 0003).
+#[derive(Clone, Copy)]
+enum Unnamed {
+    /// Leave it out, as `cli/si`'s joins do.
+    Skip,
+    /// List it under a placeholder name, e.g. for a delete preview, which
+    /// must show everything the delete removes.
+    Label,
+}
+
 /// Pairs each `(variable id, value)` with its Variable name, sorted by name.
-/// A value whose Variable row is missing is left out, as `cli/si`'s joins do.
 async fn own_variables(
-    db: &mut toasty::Db,
+    db: &mut impl toasty::Executor,
     values: Vec<(i64, String)>,
+    unnamed: Unnamed,
 ) -> Result<Vec<OwnVariable>, Error> {
     let ids: Vec<i64> = values.iter().map(|(id, _)| *id).collect();
     let names: std::collections::HashMap<i64, String> =
@@ -332,10 +390,12 @@ async fn own_variables(
     let mut own: Vec<OwnVariable> = values
         .into_iter()
         .filter_map(|(id, value)| {
-            names.get(&id).map(|name| OwnVariable {
-                name: name.clone(),
-                value,
-            })
+            let name = match (names.get(&id), unnamed) {
+                (Some(name), _) => name.clone(),
+                (None, Unnamed::Label) => format!("(Variable {id}, name missing)"),
+                (None, Unnamed::Skip) => return None,
+            };
+            Some(OwnVariable { name, value })
         })
         .collect();
     own.sort_by(|a, b| a.name.cmp(&b.name));
@@ -435,11 +495,131 @@ async fn host_warnings(db: &mut impl toasty::Executor, host_id: i64) -> Result<V
     )])
 }
 
-/// Fails with [`Error::NotFound`] unless the Host exists.
-async fn existing_host(tx: &mut toasty::Transaction<'_>, host_id: i64) -> Result<(), Error> {
-    match models::Host::filter_by_id(host_id).first().exec(tx).await? {
-        Some(_) => Ok(()),
-        None => Err(Error::NotFound(format!("Host {host_id}"))),
+/// The Host with this id, or [`Error::NotFound`].
+async fn existing_host(
+    db: &mut impl toasty::Executor,
+    host_id: i64,
+) -> Result<models::Host, Error> {
+    models::Host::filter_by_id(host_id)
+        .first()
+        .exec(db)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("Host {host_id}")))
+}
+
+/// A Host name after [`normalize_host_name`], if it isn't empty.
+fn normalized_host_name(name: &str) -> Result<String, Error> {
+    let name = normalize_host_name(name);
+    if name.is_empty() {
+        return Err(invalid(
+            "name",
+            "A Host name can't be empty: it needs at least one letter, digit, \"-\" or \"_\".",
+        ));
+    }
+    Ok(name)
+}
+
+/// Fails unless no Host other than `except` is called `name`.
+async fn unused_host_name(
+    db: &mut impl toasty::Executor,
+    name: &str,
+    except: Option<i64>,
+) -> Result<(), Error> {
+    // Every match, not just the first: cli/si may have left duplicate names.
+    let taken = models::Host::filter(models::Host::fields().name().eq(name))
+        .exec(db)
+        .await?
+        .iter()
+        .any(|other| Some(other.id) != except);
+    if taken {
+        return Err(invalid(
+            "name",
+            format!("A Host named {name} already exists."),
+        ));
+    }
+    Ok(())
+}
+
+/// The shared plan behind [`Inventory::host_deletion`] and
+/// [`Inventory::delete_host`], so the preview and the delete can't disagree.
+async fn plan_host_deletion(
+    db: &mut impl toasty::Executor,
+    host_id: i64,
+) -> Result<HostDeletion, Error> {
+    let host = existing_host(&mut *db, host_id).await?;
+    let values = models::HostVariable::filter(models::HostVariable::fields().host_id().eq(host_id))
+        .exec(&mut *db)
+        .await?;
+    let own_variables = own_variables(
+        &mut *db,
+        values
+            .into_iter()
+            .map(|v| (v.variable_id, v.value))
+            .collect(),
+        Unnamed::Label,
+    )
+    .await?;
+    // TEMPORARY until lager manages Group membership (#10) and Service
+    // Instances (#13): their tables aren't modelled yet, so they're counted
+    // with raw SQL and block the delete instead of cascading.
+    let groups = count_rows_for_host(
+        &mut *db,
+        "SELECT count(*) FROM host_group_membership WHERE host = ?1",
+        host_id,
+    )
+    .await?;
+    let instances = count_rows_for_host(
+        &mut *db,
+        "SELECT count(*) FROM service_instance WHERE host = ?1",
+        host_id,
+    )
+    .await?;
+    let mut blockers = Vec::new();
+    if groups > 0 {
+        blockers.push(format!(
+            "It is a member of {}, and lager can't remove Hosts from Groups yet.",
+            plural(groups, "Group")
+        ));
+    }
+    if instances > 0 {
+        blockers.push(format!(
+            "It has {}, and lager can't delete Service Instances yet.",
+            plural(instances, "Service Instance")
+        ));
+    }
+    Ok(HostDeletion {
+        host: host.into(),
+        own_variables,
+        blockers,
+    })
+}
+
+/// `"1 Group"`, `"2 Groups"`.
+fn plural(n: i64, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// Runs a raw `SELECT count(*) ... WHERE host = ?1` query for one Host.
+///
+/// A result in any other shape is an error rather than 0: a wrong 0 would
+/// let a delete through and orphan rows (ADR 0002, ADR 0003).
+async fn count_rows_for_host(
+    db: &mut impl toasty::Executor,
+    sql: &str,
+    host_id: i64,
+) -> Result<i64, Error> {
+    let rows = toasty::sql::query(sql).bind(host_id).exec(db).await?;
+    let mut rows = rows.into_iter();
+    match (rows.next(), rows.next()) {
+        (Some(Value::Record(r)), None) => match r.into_iter().collect::<Vec<_>>().as_slice() {
+            [Value::I64(n)] => Ok(*n),
+            other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
+        },
+        other => Err(Error::Unexpected(format!("{sql} returned {other:?}"))),
     }
 }
 

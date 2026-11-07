@@ -710,3 +710,242 @@ async fn setting_a_duplicate_server_index_warns_naming_the_other_host() {
 
     assert_eq!(done.warnings, ["Server Index 1 is also used by web1."]);
 }
+
+// Renaming and deleting Hosts
+
+/// How many rows in `table` refer to the Host through `column`.
+fn rows_referring_to(db: &common::TempDb, table: &str, column: &str, host_id: i64) -> i64 {
+    rusqlite::Connection::open(&db.path)
+        .unwrap()
+        .query_row(
+            &format!("SELECT count(*) FROM {table} WHERE {column} = ?1"),
+            [host_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn renaming_a_host_keeps_its_identity_and_own_variables() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    inventory
+        .set_host_variable(web1.id, "port", "80")
+        .await
+        .unwrap();
+    let before = inventory.host_variables(web1.id).await.unwrap();
+
+    let renamed = inventory
+        .rename_host(web1.id, "Web-01")
+        .await
+        .unwrap()
+        .value;
+
+    assert_eq!(renamed.id, web1.id);
+    assert_eq!(renamed.name, "web-01");
+    assert_eq!(inventory.host(web1.id).await.unwrap(), Some(renamed));
+    assert_eq!(inventory.host_variables(web1.id).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn renaming_a_host_follows_the_name_rules() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    inventory.create_host("web2", None).await.unwrap();
+
+    for (name, says) in [("", "empty"), ("!!!", "empty"), ("WEB2", "web2")] {
+        let err = inventory.rename_host(web1.id, name).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid { field: "name", ref message } if message.contains(says)),
+            "{name:?}: {err:?}"
+        );
+    }
+    assert_eq!(inventory.host(web1.id).await.unwrap().unwrap().name, "web1");
+}
+
+#[tokio::test]
+async fn renaming_a_host_to_its_own_name_is_allowed() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+
+    assert_eq!(
+        inventory
+            .rename_host(web1.id, " WEB1 ")
+            .await
+            .unwrap()
+            .value,
+        web1
+    );
+}
+
+#[tokio::test]
+async fn renaming_an_unknown_host_is_not_found() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+
+    let err = inventory.rename_host(42, "web1").await.unwrap_err();
+
+    assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn the_delete_preview_lists_the_host_and_its_own_variables() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    inventory
+        .set_host_variable(web1.id, "port", "80")
+        .await
+        .unwrap();
+
+    let preview = inventory.host_deletion(web1.id).await.unwrap();
+
+    assert_eq!(preview.host, web1);
+    assert_eq!(
+        preview.own_variables,
+        [own("port", "80"), own(SERVER_INDEX, "1")]
+    );
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+}
+
+#[tokio::test]
+async fn deleting_a_host_removes_exactly_what_the_preview_listed() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    let web2 = inventory.create_host("web2", None).await.unwrap().value;
+    inventory
+        .set_host_variable(web1.id, "port", "80")
+        .await
+        .unwrap();
+    inventory
+        .set_host_variable(web2.id, "port", "81")
+        .await
+        .unwrap();
+    let preview = inventory.host_deletion(web1.id).await.unwrap();
+
+    let done = inventory.delete_host(web1.id).await.unwrap();
+
+    assert_eq!(done.value, preview);
+    assert_eq!(inventory.host(web1.id).await.unwrap(), None);
+    assert_eq!(
+        inventory.hosts().await.unwrap(),
+        std::slice::from_ref(&web2)
+    );
+    for table in ["host_variable", "host_group_membership", "service_instance"] {
+        assert_eq!(rows_referring_to(&db, table, "host", web1.id), 0, "{table}");
+    }
+    assert_eq!(
+        variables_besides_server_index(&inventory, web2.id).await,
+        [own("port", "81")]
+    );
+    assert_eq!(
+        inventory.variable_names().await.unwrap(),
+        ["port", SERVER_INDEX],
+        "Variable names stay"
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_host_is_not_found() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+
+    assert!(matches!(
+        inventory.host_deletion(42).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(matches!(
+        inventory.delete_host(42).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_host_in_groups_or_with_service_instances_cannot_be_deleted_yet() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    // Written by cli/si: lager doesn't manage these relations yet.
+    sql(
+        &db,
+        &format!(
+            "INSERT INTO host_group(id, name) VALUES (1, 'eu'), (2, 'web');
+             INSERT INTO host_group_membership(host, \"group\") VALUES ({id}, 1), ({id}, 2);
+             INSERT INTO service(id, name) VALUES (1, 'nginx');
+             INSERT INTO service_instance(service, host, ip, name) VALUES (1, {id}, '192.0.2.10', 'main');",
+            id = web1.id
+        ),
+    );
+
+    let preview = inventory.host_deletion(web1.id).await.unwrap();
+    let err = inventory.delete_host(web1.id).await.unwrap_err();
+
+    assert_eq!(
+        preview.blockers,
+        [
+            "It is a member of 2 Groups, and lager can't remove Hosts from Groups yet.",
+            "It has 1 Service Instance, and lager can't delete Service Instances yet.",
+        ]
+    );
+    assert!(
+        matches!(err, Error::Invalid { field: "host", .. }),
+        "{err:?}"
+    );
+    assert_eq!(inventory.host(web1.id).await.unwrap(), Some(web1.clone()));
+    assert_eq!(rows_referring_to(&db, "host_variable", "host", web1.id), 1);
+}
+
+#[tokio::test]
+async fn the_delete_preview_lists_values_whose_variable_name_is_missing() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    // A value whose Variable row is gone, as foreign keys off allow.
+    sql(
+        &db,
+        &format!(
+            "INSERT INTO host_variable(variable, host, value) VALUES (999, {}, '7')",
+            web1.id
+        ),
+    );
+    let preview = inventory.host_deletion(web1.id).await.unwrap();
+
+    let done = inventory.delete_host(web1.id).await.unwrap();
+
+    assert!(
+        preview
+            .own_variables
+            .contains(&own("(Variable 999, name missing)", "7")),
+        "{:?}",
+        preview.own_variables
+    );
+    assert_eq!(done.value, preview);
+    assert_eq!(rows_referring_to(&db, "host_variable", "host", web1.id), 0);
+}
+
+#[tokio::test]
+async fn renaming_rejects_a_name_another_host_already_shares() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+    let web1 = inventory.create_host("web1", None).await.unwrap().value;
+    // cli/si allows duplicate names: make web1 and another Host both "dup".
+    sql(
+        &db,
+        &format!(
+            "UPDATE host SET name = 'dup' WHERE id = {};
+             INSERT INTO host(name) VALUES ('dup');",
+            web1.id
+        ),
+    );
+
+    let err = inventory.rename_host(web1.id, "dup").await.unwrap_err();
+
+    assert!(
+        matches!(err, Error::Invalid { field: "name", ref message } if message.contains("dup")),
+        "{err:?}"
+    );
+}

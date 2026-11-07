@@ -17,7 +17,7 @@ use topcoat::{
     view::{View, component, view},
 };
 
-use crate::inventory::{self, Host, Inventory, OwnVariable};
+use crate::inventory::{self, Host, HostDeletion, Inventory, OwnVariable};
 
 /// Builds the router serving `inventory`.
 pub fn router(inventory: Inventory) -> Router {
@@ -31,6 +31,10 @@ pub fn router(inventory: Inventory) -> Router {
         .page(host_detail)
         .page(set_host_variable)
         .page(remove_host_variable)
+        .page(rename_host_form)
+        .page(rename_host)
+        .page(delete_host_confirmation)
+        .page(delete_host)
         .build()
 }
 
@@ -43,6 +47,8 @@ body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 0 auto; pad
 nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; }
 .error { color: #b00020; }
 .warnings { background: #fff4ce; border-left: 4px solid #c88a00; padding: .5rem 1rem .5rem 2rem; }
+.actions { display: flex; gap: 1rem; }
+.danger { color: #fff; background: #b00020; border: 0; padding: .4rem .8rem; }
 .hint { color: #555; font-size: .9em; margin: .25rem 0; }
 label { display: block; margin-bottom: .25rem; }
 table { border-collapse: collapse; width: 100%; }
@@ -329,6 +335,10 @@ async fn host_view(
         }
         <p><a href=(href!(hosts_list))>"All Hosts"</a></p>
         <h1>(host.name)</h1>
+        <p class="actions">
+            <a href=(href!(rename_host_form, HostId(host_id)))>"Rename"</a>
+            <a href=(href!(delete_host_confirmation, HostId(host_id)))>"Delete…"</a>
+        </p>
         if !warnings.is_empty() {
             <ul class="warnings" role="status">
                 for warning in warnings {
@@ -419,5 +429,133 @@ async fn host_view(
             }
             <p><button type="submit">"Add Variable"</button></p>
         </form>
+    })
+}
+
+#[derive(Deserialize)]
+struct RenameHost {
+    name: String,
+}
+
+#[page("/hosts/{host_id}/rename")]
+async fn rename_host_form(cx: &Cx) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    let name = host.name.clone();
+    Ok(view! { rename_host_view(host: host, name: name, error: None) })
+}
+
+#[page(POST "/hosts/{host_id}/rename")]
+async fn rename_host(cx: &Cx, Form(input): Form<RenameHost>) -> Result<impl View> {
+    let host = path_host(cx).await?;
+    match inventory(cx).rename_host(host.id, &input.name).await {
+        Ok(_) => Err(see_other(href!(host_detail, HostId(host.id)).resolve(cx)).into()),
+        Err(inventory::Error::Invalid { message, .. }) => {
+            Ok(view! { rename_host_view(host: host, name: input.name, error: Some(message)) })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+/// The rename form for `host`, showing `name` as typed and the error it was
+/// rejected with, if any.
+#[component]
+async fn rename_host_view(host: Host, name: String, error: Option<String>) -> Result<impl View> {
+    Ok(view! {
+        if error.is_some() {
+            (StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        <h1>"Rename " (host.name)</h1>
+        <form method="post" action=(href!(rename_host, HostId(host.id)))>
+            <label for="name">"New name"</label>
+            <input id="name" name="name" value=(name) required=(true) autofocus=(true)
+                if error.is_some() {
+                    aria-invalid="true"
+                    aria-describedby="name-hint name-error"
+                } else {
+                    aria-describedby="name-hint"
+                }
+            >
+            <p id="name-hint" class="hint">
+                "Saved in lowercase, keeping only letters a–z, digits, \"-\" and \"_\". Everything attached to the Host stays attached."
+            </p>
+            if let Some(error) = error {
+                <p id="name-error" class="error">(error)</p>
+            }
+            <p class="actions">
+                <button type="submit">"Rename"</button>
+                <a href=(href!(host_detail, HostId(host.id)))>"Cancel"</a>
+            </p>
+        </form>
+    })
+}
+
+#[page("/hosts/{host_id}/delete")]
+async fn delete_host_confirmation(cx: &Cx) -> Result<impl View> {
+    let id = *path_param::<HostId>(cx)?;
+    let deletion = inventory(cx).host_deletion(id).await.map_err(page_error)?;
+    Ok(view! { delete_host_view(deletion: deletion, refused: false) })
+}
+
+#[page(POST "/hosts/{host_id}/delete")]
+async fn delete_host(cx: &Cx) -> Result<impl View> {
+    let id = *path_param::<HostId>(cx)?;
+    match inventory(cx).delete_host(id).await {
+        Ok(_) => Err(see_other(href!(hosts_list).resolve(cx)).into()),
+        // Something blocks the delete: show the confirmation page again,
+        // which says what.
+        Err(inventory::Error::Invalid { .. }) => {
+            let deletion = inventory(cx).host_deletion(id).await.map_err(page_error)?;
+            Ok(view! { delete_host_view(deletion: deletion, refused: true) })
+        }
+        Err(e) => Err(page_error(e)),
+    }
+}
+
+/// The delete confirmation: everything that will be removed, or why the
+/// Host can't be deleted yet. `refused` marks a delete that was attempted
+/// and blocked.
+#[component]
+async fn delete_host_view(deletion: HostDeletion, refused: bool) -> Result<impl View> {
+    let host_id = deletion.host.id;
+    let blocked = !deletion.blockers.is_empty();
+    Ok(view! {
+        if refused {
+            (StatusCode::CONFLICT)
+        }
+        <h1>"Delete " (deletion.host.name.clone())</h1>
+        if blocked {
+            <div class="error" role="alert">
+                <p>(deletion.host.name.clone()) " can't be deleted yet."</p>
+                <ul>
+                    for blocker in deletion.blockers {
+                        <li>(blocker)</li>
+                    }
+                </ul>
+            </div>
+            <p><a href=(href!(host_detail, HostId(host_id)))>"Back to " (deletion.host.name)</a></p>
+        } else {
+            <p>"This removes the Host " <strong>(deletion.host.name.clone())</strong> " and:"</p>
+            if deletion.own_variables.is_empty() {
+                <p>"No Own Variables."</p>
+            } else {
+                <table>
+                    <caption>"Own Variables"</caption>
+                    <thead><tr><th>"Name"</th><th>"Value"</th></tr></thead>
+                    <tbody>
+                        #[key(variable.name.clone())]
+                        for variable in deletion.own_variables {
+                            <tr><th scope="row">(variable.name)</th><td><code>(variable.value)</code></td></tr>
+                        }
+                    </tbody>
+                </table>
+            }
+            <p class="hint">"Variable names stay, for anything else using them."</p>
+            <form method="post" action=(href!(delete_host, HostId(host_id)))>
+                <p class="actions">
+                    <button type="submit" class="danger">"Delete " (deletion.host.name)</button>
+                    <a href=(href!(host_detail, HostId(host_id)))>"Cancel"</a>
+                </p>
+            </form>
+        }
     })
 }

@@ -165,3 +165,77 @@ async fn suggests_the_next_server_index_and_warns_about_a_duplicate_after_saving
         "{page}"
     );
 }
+
+#[tokio::test]
+async fn renames_a_host_from_its_rename_page() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    create_host(&router, "web2").await;
+
+    let form = text(get(&router, &format!("{host}/rename")).await).await;
+    assert!(form.contains(r#"value="web1""#), "{form}");
+
+    let rejected = post_form(&router, &format!("{host}/rename"), "name=web2").await;
+    assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let page = text(rejected).await;
+    assert!(page.contains("A Host named web2 already exists."), "{page}");
+    assert!(page.contains(r#"value="web2""#), "{page}");
+
+    let renamed = post_form(&router, &format!("{host}/rename"), "name=web-01").await;
+    assert_eq!(location(&renamed), host);
+    assert!(
+        text(get(&router, &host).await)
+            .await
+            .contains("<h1>web-01</h1>")
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_host_goes_through_a_confirmation_listing_its_variables() {
+    let (_db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    post_form(
+        &router,
+        &format!("{host}/variables"),
+        "form=add&name=port&value=80",
+    )
+    .await;
+
+    // Opening the confirmation, then cancelling, changes nothing.
+    let confirm = text(get(&router, &format!("{host}/delete")).await).await;
+    assert!(confirm.contains("port"), "{confirm}");
+    assert!(confirm.contains("server_index"), "{confirm}");
+    assert!(
+        confirm.contains(&format!(r#"href="{host}""#)),
+        "cancel link: {confirm}"
+    );
+    let page = text(get(&router, &host).await).await;
+    assert!(page.contains(r#"<th scope="row">port</th>"#), "{page}");
+
+    let deleted = post_form(&router, &format!("{host}/delete"), "").await;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(location(&deleted), "/hosts");
+    assert_eq!(get(&router, &host).await.status(), StatusCode::NOT_FOUND);
+    assert!(!text(get(&router, "/hosts").await).await.contains("web1"));
+}
+
+#[tokio::test]
+async fn a_host_in_a_group_cannot_be_deleted_yet() {
+    let (db, router) = app().await;
+    let host = create_host(&router, "web1").await;
+    let conn = rusqlite::Connection::open(&db.path).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO host_group(id, name) VALUES (1, 'eu');
+         INSERT INTO host_group_membership(host, \"group\") SELECT id, 1 FROM host;",
+    )
+    .unwrap();
+
+    let confirm = text(get(&router, &format!("{host}/delete")).await).await;
+    assert!(confirm.contains("member of 1 Group"), "{confirm}");
+    assert!(!confirm.contains("<button"), "no delete button: {confirm}");
+
+    let refused = post_form(&router, &format!("{host}/delete"), "").await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(get(&router, &host).await.status(), StatusCode::OK);
+}
