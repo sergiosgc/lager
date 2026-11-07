@@ -40,6 +40,7 @@ const STYLE: &str = "
 body { font-family: system-ui, sans-serif; max-width: 48rem; margin: 0 auto; padding: 0 1rem; }
 nav { display: flex; gap: 1rem; padding: 1rem 0; border-bottom: 1px solid #ccc; }
 .error { color: #b00020; }
+.hint { color: #555; font-size: .9em; margin: .25rem 0; }
 label { display: block; margin-bottom: .25rem; }
 ";
 
@@ -123,9 +124,14 @@ async fn new_host_view(name: String, error: Option<String>) -> Result<impl View>
             <input id="name" name="name" value=(name) required=(true) autofocus=(true)
                 if error.is_some() {
                     aria-invalid="true"
-                    aria-describedby="name-error"
+                    aria-describedby="name-hint name-error"
+                } else {
+                    aria-describedby="name-hint"
                 }
             >
+            <p id="name-hint" class="hint">
+                "Saved in lowercase, keeping only letters a–z, digits, \"-\" and \"_\"."
+            </p>
             if let Some(error) = error {
                 <p id="name-error" class="error">(error)</p>
             }

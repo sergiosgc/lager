@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 use toasty::stmt::Value;
 
+/// The file opened when the database path given is a directory.
+pub const DATABASE_FILE_NAME: &str = "database.sqlite";
+
 /// The only `db_version` Lager knows how to read and write.
 pub const SUPPORTED_DB_VERSION: i64 = 1;
 
@@ -120,12 +123,19 @@ pub struct Inventory {
 impl Inventory {
     /// Opens an existing inventory database, refusing a missing file or one
     /// whose `db_version` isn't [`SUPPORTED_DB_VERSION`] (ADR 0002).
+    ///
+    /// A directory stands for the [`DATABASE_FILE_NAME`] inside it.
     pub async fn open(path: &Path) -> Result<Self, OpenError> {
+        let path = if path.is_dir() {
+            path.join(DATABASE_FILE_NAME)
+        } else {
+            path.to_path_buf()
+        };
         // Checked first: the SQLite driver would otherwise create the file.
         if !path.is_file() {
-            return Err(OpenError::Missing(path.to_path_buf()));
+            return Err(OpenError::Missing(path));
         }
-        let mut db = open_without_foreign_keys(path).await?;
+        let mut db = open_without_foreign_keys(&path).await?;
         let found = read_db_version(&mut db).await?;
         if found != Some(SUPPORTED_DB_VERSION) {
             return Err(OpenError::UnsupportedVersion { found });
@@ -153,13 +163,17 @@ impl Inventory {
         Ok(host.map(Host::from))
     }
 
-    /// Creates a Host. Its name, with surrounding whitespace removed, must be
-    /// non-empty and not already used by another Host.
+    /// Creates a Host. Its name is normalised (see [`normalize_host_name`])
+    /// and must then be non-empty and not already used by another Host.
     pub async fn create_host(&self, name: &str) -> Result<Done<Host>, Error> {
-        let name = name.trim();
+        let name = normalize_host_name(name);
         if name.is_empty() {
-            return Err(invalid("name", "A Host name can't be empty."));
+            return Err(invalid(
+                "name",
+                "A Host name can't be empty: it needs at least one letter, digit, \"-\" or \"_\".",
+            ));
         }
+        let name = name.as_str();
         let mut db = self.db.clone();
         let mut tx = db.transaction().await?;
         let existing = models::Host::filter(models::Host::fields().name().eq(name))
@@ -176,6 +190,16 @@ impl Inventory {
         tx.commit().await?;
         Ok(Done::ok(host.into()))
     }
+}
+
+/// The name a Host is stored under: lowercased, keeping only `a`-`z`,
+/// `0`-`9`, `-` and `_`. Anything else, including spaces, dots and
+/// non-ASCII letters, is dropped.
+pub fn normalize_host_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .filter(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
+        .collect()
 }
 
 fn invalid(field: &'static str, message: impl Into<String>) -> Error {

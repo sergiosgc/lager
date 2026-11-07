@@ -21,6 +21,30 @@ async fn refuses_a_missing_database_file() {
 }
 
 #[tokio::test]
+async fn opens_database_sqlite_inside_a_given_directory() {
+    let db = temp_db();
+    open(&db).await.create_host("web1").await.unwrap();
+
+    let inventory = Inventory::open(db.dir.path()).await.unwrap();
+
+    assert_eq!(inventory.hosts().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn refuses_a_directory_without_database_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let err = Inventory::open(dir.path()).await.err().unwrap();
+
+    let expected = dir.path().join("database.sqlite");
+    assert!(
+        matches!(err, OpenError::Missing(ref p) if p == &expected),
+        "{err:?}"
+    );
+    assert!(!expected.exists(), "opening must not create the file");
+}
+
+#[tokio::test]
 async fn refuses_a_database_with_another_db_version() {
     let db = temp_db();
     rusqlite::Connection::open(&db.path)
@@ -92,7 +116,7 @@ async fn rejects_an_empty_host_name() {
     let db = temp_db();
     let inventory = open(&db).await;
 
-    for name in ["", "   "] {
+    for name in ["", "   ", "!!!", "ÉÉ."] {
         let err = inventory.create_host(name).await.unwrap_err();
         assert!(
             matches!(err, Error::Invalid { field: "name", ref message } if message.contains("empty")),
@@ -118,17 +142,33 @@ async fn rejects_a_duplicate_host_name() {
 }
 
 #[tokio::test]
-async fn trims_surrounding_whitespace_from_host_names() {
+async fn normalizes_host_names_to_lowercase_letters_digits_dashes_and_underscores() {
+    let db = temp_db();
+    let inventory = open(&db).await;
+
+    for (given, stored) in [
+        (" DB1 ", "db1"),
+        ("Web-01.Example_X", "web-01example_x"),
+        ("mail server #2", "mailserver2"),
+        ("Ça-va", "a-va"),
+    ] {
+        let host = inventory.create_host(given).await.unwrap().value;
+        assert_eq!(host.name, stored, "{given:?}");
+    }
+}
+
+#[tokio::test]
+async fn rejects_a_name_that_normalizes_to_an_existing_host() {
     let db = temp_db();
     let inventory = open(&db).await;
     inventory.create_host("web1").await.unwrap();
 
-    assert_eq!(
-        inventory.create_host(" db1 ").await.unwrap().value.name,
-        "db1"
-    );
-    assert!(
-        inventory.create_host(" web1 ").await.is_err(),
-        "trimmed duplicate"
-    );
+    for name in ["WEB1", " web1 ", "web.1"] {
+        let err = inventory.create_host(name).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Invalid { field: "name", ref message } if message.contains("web1")),
+            "{name:?}: {err:?}"
+        );
+    }
+    assert_eq!(inventory.hosts().await.unwrap().len(), 1);
 }
